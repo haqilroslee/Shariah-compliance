@@ -1,6 +1,6 @@
 """
-Shariah Stock Checker: a simple web app for family and friends.
-Screening rules follow the family methodology (tiers at 30% / 33%, 5% revenue limit,
+WattleFolio Shariah Checker: screens shares and ETFs for Shariah compliance.
+Screening rules follow the WattleFolio methodology (tiers at 30% / 33%, 5% revenue limit,
 24-month average market cap, 60-day exit window, purging, 2.5% zakat).
 """
 import html
@@ -68,7 +68,7 @@ TIER_STYLE = {
     "Incomplete": ("Can't tell yet", "#ECEEF0", "#33414D", "Some company figures are missing, so this stock can't be scored."),
 }
 
-st.set_page_config(page_title="Shariah Stock Checker", page_icon="🌙", layout="centered")
+st.set_page_config(page_title="WattleFolio Shariah Checker", page_icon="🌙", layout="centered")
 st.markdown("""
 <style>
 html, body, [class*="css"] { font-size: 18px; }
@@ -311,7 +311,7 @@ def ratio(a, b):
 
 
 def review_pct(review):
-    """Family-entered non-permissible revenue %, tolerating '1.2%' or '1,2'. None if blank or unreadable."""
+    """Review-list non-permissible revenue %, tolerating '1.2%' or '1,2'. None if blank or unreadable."""
     raw = review["non_permissible_revenue_pct"].strip().rstrip("%").strip().replace(",", ".")
     try:
         return float(raw) / 100 if raw else None
@@ -365,26 +365,26 @@ def screen(d):
     review = load_review().get(d["symbol"].upper())
     industry = f'{d["industry"]} {d["sector"]}'.lower()
 
-    # Non-permissible revenue: family figure if entered, otherwise interest income as an estimate
+    # Non-permissible revenue: review-list figure if entered, otherwise interest income as an estimate
     np_pct, np_source = None, ""
     if review is not None and review_pct(review) is not None:
-        np_pct, np_source = review_pct(review), "family review"
+        np_pct, np_source = review_pct(review), "WattleFolio review list"
     elif d["revenue"]:
         np_pct, np_source = min(abs(d["interest_income"] or 0) / d["revenue"], 1.0), "estimate (interest income only)"
         if review is not None and review["non_permissible_revenue_pct"].strip():
-            np_source += "; the family figure in sector_review.csv couldn't be read"
+            np_source += "; the figure in the review list couldn't be read"
 
     # Almost no sales yet (explorers, biotechs): interest on cash dwarfs revenue, so the 5% test says little
     pre_revenue = np_source.startswith("estimate") and np_pct is not None and np_pct >= PRE_REVENUE_SHARE
-    checked_by = "family" if review is not None and review["excluded"].strip().lower() in ("yes", "no") else "automatic"
+    checked_by = "manual" if review is not None and review["excluded"].strip().lower() in ("yes", "no") else "automatic"
     if review is not None and review["excluded"].strip().lower() == "yes":
-        business, why = "Fail", "The family review marked this business as excluded."
+        business, why = "Fail", "Marked as excluded in the WattleFolio review list."
     elif review is None and any(k in industry for k in EXCLUDED_KEYWORDS):
         business, why = "Fail", f"Its industry ({d['industry']}) is on the excluded list."
     elif np_pct is not None and np_pct >= REVENUE_LIMIT and not pre_revenue:
         business, why = "Fail", f"{np_pct:.1%} of revenue comes from non-permissible sources (limit is under 5%)."
-    elif checked_by == "family":
-        business, why = "Pass", "Business activities checked by the family."
+    elif checked_by == "manual":
+        business, why = "Pass", "Business activities checked manually (WattleFolio review list)."
     else:
         # Automatic check: pass only when nothing at all needs a closer look
         reasons = []
@@ -442,7 +442,7 @@ def holding_candidates(sym, fund_symbol):
 
 
 def screen_fund(f):
-    """Look through an ETF's published top holdings and screen each one with the family rules."""
+    """Look through an ETF's published top holdings and screen each one with the WattleFolio rules."""
     islamic = any(w in f["name"].lower() for w in ISLAMIC_FUND_WORDS)
     rows, failed, watch = [], [], False
     checked, purge_sum = 0.0, 0.0
@@ -473,7 +473,7 @@ def screen_fund(f):
         action = "An Islamic fund: it is screened by its own Shariah board. Check which standard it follows."
         why = "The fund's name says it is Shariah-compliant, so it follows its own Shariah board's rules."
         if failed:
-            note = (f"Under the family rules, {len(failed)} of its top holdings would not be compliant "
+            note = (f"Under the WattleFolio rules, {len(failed)} of its top holdings would not be compliant "
                     f"({', '.join(failed)}). Its board may use a different standard.")
     elif f["bonds"] > FUND_MAX_BONDS:
         tier, why = "Tier 3", f"{f['bonds']:.0%} of the fund is in bonds, which pay interest."
@@ -489,7 +489,7 @@ def screen_fund(f):
         action = "Its top holdings pass, but most of the fund can't be checked here. Ask a scholar or use a certified Islamic ETF."
     else:
         tier = "Tier 2" if watch else "Tier 1"
-        why = "Every holding passes the family rules."
+        why = "Every holding passes the WattleFolio rules."
 
     return {
         "tier": tier, "business": "Pass", "why": why, "action": action, "note": note,
@@ -599,7 +599,7 @@ def standards_table(s):
     cards([(name, pill(result, "Tier 1" if result == "Pass" else "Tier 3" if result.startswith("Fail") else "Incomplete"), f"vs {basis}",
             [(t, f"{pct(v)} <small>/ max {limit * 100:g}%</small>", v is not None and v > limit) for t, v, limit in tests])
            for name, (basis, tests, result) in s["standards"].items()])
-    st.caption("For comparison only: the colour above follows the family rules. "
+    st.caption("For comparison only: the colour above follows the WattleFolio rules. "
                "Every standard also needs under 5% non-permissible revenue. "
                "\"Cash\" here is all of the company's cash; the standards only count interest-earning cash, "
                "so cash-rich companies can look worse than they really are.")
@@ -610,7 +610,7 @@ def fund_detail(d, s):
     st.write(s["why"])
     if s["rows"]:
         st.subheader("What's inside")
-        st.caption(f"The {len(s['rows'])} biggest holdings Yahoo Finance publishes, each checked with the family rules.")
+        st.caption(f"The {len(s['rows'])} biggest holdings Yahoo Finance publishes, each checked with the WattleFolio rules.")
         st.markdown("".join(
             f'<div class="holding"><div><div class="nm">{html.escape(r["Holding"])}</div>'
             f'<div class="meta"><span>{html.escape(r["Code"])}</span>{pill(r["Result"], r["tier"])}</div></div>'
@@ -635,15 +635,15 @@ def fund_detail(d, s):
 
 
 def rules_cards():
-    """The family rules next to each standard's limits, built from the settings at the top."""
+    """The WattleFolio rules next to each standard's limits, built from the settings at the top."""
     def lim(x):
         return f"under {x * 100:g}%"
-    family = f"{TIER1_MAX * 100:g}% <small>(watch to {TIER2_MAX * 100:g}%)</small>"
+    ours = f"{TIER1_MAX * 100:g}% <small>(watch to {TIER2_MAX * 100:g}%)</small>"
     revenue = ("Non-permissible revenue", lim(REVENUE_LIMIT), False)
     djim_extra = "*" if DJIM_TEST_CASH_RECEIVABLES else ""
     cards([
-        ("Family rules", "", "vs 2-year average market value",
-         [("Debt", family, False), ("Cash", family, False), ("Money owed", family, False), revenue]),
+        ("WattleFolio rules", "", "vs 2-year average market value",
+         [("Debt", ours, False), ("Cash", ours, False), ("Money owed", ours, False), revenue]),
         ("AAOIFI", "", "vs current market value",
          [("Debt", lim(AAOIFI_LIMIT), False), ("Cash", lim(AAOIFI_LIMIT), False), ("Money owed", "not tested", False), revenue]),
         ("Dow Jones Islamic", "", "vs 2-year average market value",
@@ -756,7 +756,7 @@ def write_holdings(df):
 
 
 # ----------------------------------------------------------------------------- pages
-st.title("Shariah Stock Checker")
+st.title("WattleFolio Shariah Checker")
 
 tab_check, tab_ideas, tab_mine, tab_how = st.tabs(["Check", "Find stocks", "My holdings", "How it works"])
 
@@ -824,7 +824,7 @@ with tab_check:
                     source_detail(d)
 
 with tab_ideas:
-    st.write(f"The largest companies in a market, screened with the family rules. The top {IDEAS_SHOW} that pass "
+    st.write(f"The largest companies in a market, screened with the WattleFolio rules. The top {IDEAS_SHOW} that pass "
              "are listed, sorted the way you choose.")
     st.caption("These are ideas to research, not recommendations or financial advice. They're ranked on figures "
                "only, so check each company yourself before buying.")
@@ -991,13 +991,13 @@ and pay zakat of 2.5% on compliant and on-watch holdings.
 with the rules above. An ETF is not compliant if any of them fails, or if more than 1% of it is in bonds.
 If they all pass but don't make up the whole fund, it shows "Can't tell yet", because the rest can't be seen.
 Funds with Islamic, Shariah or Halal in their name have their own Shariah board, so they're shown as compliant,
-with the family-rule check of their holdings alongside. Dividend cleaning uses the average of the holdings checked.
+with the WattleFolio check of their holdings alongside. Dividend cleaning uses the average of the holdings checked.
 
-**7. Find stocks.** Lists the largest companies in a market that pass the family rules, sorted by the
+**7. Find stocks.** Lists the largest companies in a market that pass the WattleFolio rules, sorted by the
 figure you choose. Banks and insurers are left out before screening. These are ideas to research, not
 recommendations. The list is worked out once a day, so the first search of the day takes a few minutes.
 
-**How the family rules compare with the main standards.** Our rules are closest to Dow Jones Islamic
+**How the WattleFolio rules compare with the main standards.** Our rules are closest to Dow Jones Islamic
 (same 2-year average), but stricter: on-watch starts at 30%. Each stock's
 "More detail" section shows how every standard below would judge it.
 

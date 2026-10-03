@@ -1,4 +1,4 @@
-# Shariah Stock Checker: putting it online
+# WattleFolio Shariah Checker: putting it online
 
 Takes about 15 minutes, once. Do this on a computer.
 
@@ -10,7 +10,7 @@ Takes about 15 minutes, once. Do this on a computer.
 ## 2. Launch the app
 1. Go to share.streamlit.io and sign in with your GitHub account.
 2. Click **Create app** → deploy from a GitHub repository.
-3. Pick the `shariah-checker` repository, branch `main`, main file `app.py`. Optionally choose a custom address, e.g. `family-shariah-checker`.
+3. Pick the `shariah-checker` repository, branch `main`, main file `app.py`. Optionally choose a custom address, e.g. `wattlefolio-shariah-checker`.
 4. Click **Deploy**. The first start takes a few minutes.
 
 ## 3. Set up your father-in-law's link
@@ -60,7 +60,7 @@ or Halal in their name are treated as screened by their own Shariah board (`ISLA
 
 ## Find stocks
 The **Find stocks** tab takes the largest companies in a market (Australia, United States or Malaysia) from
-Yahoo Finance's screener, leaves out the Financial Services sector, screens the rest with the family rules and
+Yahoo Finance's screener, leaves out the Financial Services sector, screens the rest with the WattleFolio rules and
 lists the top 50 that pass. You can sort by size, dividend yield, 1-year price change, P/E, debt or room under the
 Shariah limits. It only runs when someone taps the button, and results are saved for 24 hours. The number of
 companies screened is `IDEAS_CANDIDATES` at the top of `app.py`.
