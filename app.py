@@ -146,7 +146,8 @@ html, body, .stApp, .stApp p, .stApp li, .stApp input, .stApp button, .stApp lab
 .bar .tick { position: absolute; top: -4px; bottom: -4px; width: 2px; background: var(--wf-muted); }
 .row { display: flex; justify-content: space-between; font-size: 1rem; }
 .src { font-size: 0.85rem; opacity: 0.8; margin: -0.6rem 0 1rem; line-height: 1.5; }
-.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(150px, 100%), 1fr)); gap: 0.5rem; margin: 0 0 0.6rem; }
+.stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0.5rem; margin: 0 0 0.6rem; }
+.stat .v .txt { font-size: 0.95rem; }
 .stat { background: var(--wf-surface); border: 1px solid var(--wf-line); border-radius: 8px; padding: 0.55rem 0.8rem;
         min-width: 0; overflow-wrap: anywhere; }
 .stat .k { font-size: 0.78rem; color: var(--wf-muted); }
@@ -183,6 +184,7 @@ html, body, .stApp, .stApp p, .stApp li, .stApp input, .stApp button, .stApp lab
 .holding .meta { font-size: 0.85rem; margin-top: 0.2rem; display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; }
 .holding .wt { font-weight: 600; white-space: nowrap; }
 @media (max-width: 640px) {
+  .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   html, body, [class*="css"] { font-size: 16px; }
   .verdict { padding: 1.1rem 1.2rem; }
   .verdict .label { font-size: 1.8rem; }
@@ -310,6 +312,7 @@ def fetch_fund(t, info, symbol):
         "divisor": divisor,
         "holdings": holdings,
         "bonds": assets.get("bondPosition") or 0.0,
+        "stocks": assets.get("stockPosition"),
         "sectors": {k: v for k, v in sectors.items() if v},
         "dps_12m": dividends_12m(t, divisor),
     }
@@ -839,7 +842,7 @@ def research_links(d):
 
 
 def key_figures(d):
-    """Basic details: price and day change, size, valuation, yield, 52-week range, 1-year change."""
+    """Eight basic details (two even rows of four, or four rows of two on a phone)."""
     tiles = []
     change = ""
     if d.get("prev_close"):
@@ -855,13 +858,27 @@ def key_figures(d):
         tiles.append(("Fees", f"{d['fee']:.2%} a year" if d.get("fee") is not None else "–", "annual management cost"))
     dy = d["dps_12m"] / d["price"] if d.get("dps_12m") and d["price"] else 0.0
     tiles.append(("Dividend yield", f"{dy:.2%}", "last 12 months"))
+    dps, dps_ccy = to_display(d.get("dps_12m"), d["price_ccy"])
+    tiles.append(("Dividend per share", f'<span class="nw">{num_text(dps)}</span> {dps_ccy}' if dps is not None else "–",
+                  "paid in the last 12 months"))
     if d.get("low_52w") and d.get("high_52w"):
         lo, hi = to_display(d["low_52w"], d["price_ccy"])[0], to_display(d["high_52w"], d["price_ccy"])[0]
         tiles.append(("52-week range", f'<span class="nw">{num_text(lo)} –</span> <span class="nw">{num_text(hi)}</span>',
                       to_display(1, d["price_ccy"])[1]))
+    else:
+        tiles.append(("52-week range", "–", "lowest – highest price"))
     if d.get("ret_1y") is not None:
         tiles.append(("1-year change", f'<span class="{"up" if d["ret_1y"] >= 0 else "down"}">{d["ret_1y"]:+.1%}</span>',
                       "share price"))
+    else:
+        tiles.append(("1-year change", "–", "share price"))
+    if d["kind"] == "stock":
+        tiles.append(("Industry", f'<span class="txt">{html.escape(d.get("industry") or "–")}</span>',
+                      d.get("sector") or ""))
+    else:
+        stocks = d.get("stocks")
+        tiles.append(("Invested in shares", f"{stocks:.0%}" if stocks is not None else "–",
+                      f"bonds {d['bonds']:.0%}" if stocks is not None else "rest in cash or bonds"))
     st.markdown('<div class="stats">' + "".join(
         f'<div class="stat"><div class="k">{k}</div><div class="v">{v}</div>'
         f'<div class="s">{sub if sub.startswith("<span") else html.escape(sub)}</div></div>'
