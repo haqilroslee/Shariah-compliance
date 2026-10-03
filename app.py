@@ -25,6 +25,9 @@ SP_LIMIT = 0.33           # S&P Shariah: debt and cash vs 36-month average marke
 SP_RECEIVABLES_LIMIT = 0.49   # S&P Shariah: receivables + cash vs 36-month average market cap
 MSCI_LIMIT = 0.3333       # MSCI Islamic: debt, cash, receivables + cash, each vs total assets
 INCLUDE_LEASES = True     # count lease liabilities as interest-bearing debt
+ISLAMIC_FUND_WORDS = ["islamic", "shariah", "sharia", "syariah", "halal"]   # in a fund's name = has its own Shariah board
+FUND_FULL_COVERAGE = 0.99  # share of an ETF the published holdings must cover to give a full verdict
+FUND_MAX_BONDS = 0.01     # conventional bonds pay interest; more than this fails an ETF
 NEXT_REVIEW = date(2027, 2, 7)   # last day of Sha'ban 1448 (approx, confirm by moon sighting)
 REVIEWER = "Haqil"        # who checks business activities
 
@@ -92,10 +95,57 @@ def latest(df, *labels):
     return None
 
 
+def dividends_12m(t, divisor):
+    """Dividends paid per share over the last 12 months (Yahoo, quote currency). None if unavailable."""
+    try:
+        divs = t.dividends
+        if divs is None or divs.empty:
+            return 0.0
+        cutoff = pd.Timestamp.now(tz=divs.index.tz) - pd.Timedelta(days=365)
+        return float(divs[divs.index >= cutoff].sum()) / divisor
+    except Exception:
+        return None
+
+
+def fetch_fund(t, info, symbol):
+    """ETF or managed fund: price, dividends and the top holdings Yahoo publishes."""
+    quote_ccy = info.get("currency")
+    divisor = 1
+    if quote_ccy in MINOR_UNITS:
+        quote_ccy, divisor = MINOR_UNITS[quote_ccy]
+    closes = t.history(period="1mo", auto_adjust=False)["Close"].dropna()
+    if closes.empty:
+        raise ValueError("no price data found")
+    holdings, assets, sectors = [], {}, {}
+    try:
+        fd = t.funds_data
+        top = fd.top_holdings
+        if top is not None and not top.empty:
+            holdings = [(str(sym), str(row["Name"]), float(row["Holding Percent"])) for sym, row in top.iterrows()]
+        assets = fd.asset_classes or {}
+        sectors = fd.sector_weightings or {}
+    except Exception:
+        pass
+    return {
+        "kind": "fund",
+        "symbol": symbol,
+        "name": info.get("longName") or info.get("shortName") or symbol,
+        "exchange": info.get("exchange", ""),
+        "price": float(closes.iloc[-1]) / divisor,
+        "price_ccy": quote_ccy,
+        "holdings": holdings,
+        "bonds": assets.get("bondPosition") or 0.0,
+        "sectors": {k: v for k, v in sectors.items() if v},
+        "dps_12m": dividends_12m(t, divisor),
+    }
+
+
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def fetch(symbol):
     t = yf.Ticker(symbol)
     info = t.info or {}
+    if info.get("quoteType") in ("ETF", "MUTUALFUND"):
+        return fetch_fund(t, info, symbol)
     bs = t.quarterly_balance_sheet
     if bs is None or bs.empty:
         bs = t.balance_sheet
@@ -136,18 +186,8 @@ def fetch(symbol):
     if not shares or closes.empty:
         raise ValueError("no share price data found")
 
-    # Dividends paid per share over the last 12 months (Yahoo, quote currency)
-    try:
-        divs = t.dividends
-        if divs is not None and not divs.empty:
-            cutoff = pd.Timestamp.now(tz=divs.index.tz) - pd.Timedelta(days=365)
-            dps_12m = float(divs[divs.index >= cutoff].sum()) / divisor
-        else:
-            dps_12m = 0.0
-    except Exception:
-        dps_12m = None
-
     return {
+        "kind": "stock",
         "symbol": symbol,
         "name": info.get("longName") or info.get("shortName") or symbol,
         "exchange": info.get("exchange", ""),
@@ -164,7 +204,7 @@ def fetch(symbol):
         "assets": latest(bs, "Total Assets"),
         "avg_mcap": float(closes.iloc[-24:].mean()) * shares * conv,
         "avg_mcap_36": float(closes.iloc[-36:].mean()) * shares * conv,
-        "dps_12m": dps_12m,
+        "dps_12m": dividends_12m(t, divisor),
         "mcap": float(closes.iloc[-1]) * shares * conv,
         "as_of": bs.columns[0].strftime("%d %b %Y"),
     }
@@ -177,7 +217,7 @@ def search(query):
     except Exception:
         return []
     return [(q["symbol"], f'{q.get("shortname") or q.get("longname") or q["symbol"]}  ({q["symbol"]}, {q.get("exchange", "")})')
-            for q in quotes if q.get("quoteType") == "EQUITY" and q.get("symbol")]
+            for q in quotes if q.get("quoteType") in ("EQUITY", "ETF", "MUTUALFUND") and q.get("symbol")]
 
 
 # ----------------------------------------------------------------------------- screening
@@ -277,18 +317,89 @@ def screen(d):
     }
 
 
+def holding_candidates(sym, fund_symbol):
+    """Yahoo often lists a fund's local holdings without the exchange suffix (CBA rather than CBA.AX)."""
+    if "." not in sym and "." in fund_symbol:
+        return [sym + fund_symbol[fund_symbol.rfind("."):], sym]
+    return [sym]
+
+
+def screen_fund(f):
+    """Look through an ETF's published top holdings and screen each one with the family rules."""
+    islamic = any(w in f["name"].lower() for w in ISLAMIC_FUND_WORDS)
+    rows, failed, watch = [], [], False
+    checked, purge_sum = 0.0, 0.0
+    for sym, name, weight in f["holdings"]:
+        d = None
+        for cand in holding_candidates(sym, f["symbol"]):
+            d, _ = get_data(cand)
+            if d is not None and d["kind"] == "stock":
+                break
+            d = None
+        if d is None:
+            rows.append({"Holding": name, "Code": sym, "Weight": weight * 100, "Result": "Couldn't check"})
+            continue
+        hs = screen(d)
+        result = TIER_STYLE[hs["tier"]][0] + (" (business not checked)" if hs["business"] == "Review" else "")
+        rows.append({"Holding": d["name"], "Code": d["symbol"], "Weight": weight * 100, "Result": result})
+        if hs["tier"] == "Incomplete":
+            continue
+        checked += weight
+        purge_sum += weight * hs["purge_pct"]
+        if hs["tier"] == "Tier 3":
+            failed.append(d["name"])
+        watch = watch or hs["tier"] == "Tier 2"
+
+    action, note = None, None
+    if islamic:
+        tier = "Tier 1"
+        action = "An Islamic fund: it is screened by its own Shariah board. Check which standard it follows."
+        why = "The fund's name says it is Shariah-compliant, so it follows its own Shariah board's rules."
+        if failed:
+            note = (f"Under the family rules, {len(failed)} of its top holdings would not be compliant "
+                    f"({', '.join(failed)}). Its board may use a different standard.")
+    elif f["bonds"] > FUND_MAX_BONDS:
+        tier, why = "Tier 3", f"{f['bonds']:.0%} of the fund is in bonds, which pay interest."
+    elif failed:
+        tier, why = "Tier 3", f"It holds companies that aren't compliant: {', '.join(failed)}."
+    elif not f["holdings"]:
+        tier, why = "Incomplete", "Yahoo Finance doesn't list this fund's holdings."
+        action = "Can't see what this fund holds, so it can't be checked."
+    elif checked < FUND_FULL_COVERAGE:
+        tier = "Incomplete"
+        why = (f"The holdings that could be checked pass, but they're only {checked:.0%} of the fund. "
+               f"The other {1 - checked:.0%} can't be seen here.")
+        action = "Its top holdings pass, but most of the fund can't be checked here. Ask a scholar or use a certified Islamic ETF."
+    else:
+        tier = "Tier 2" if watch else "Tier 1"
+        why = "Every holding passes the family rules."
+
+    return {
+        "tier": tier, "business": "Pass", "why": why, "action": action, "note": note,
+        "purge_pct": purge_sum / checked if checked else 0.0,
+        "purge_source": f"average of the top holdings checked, {checked:.0%} of the fund" if checked else "",
+        "rows": rows, "checked": checked, "islamic": islamic,
+    }
+
+
+def evaluate(d):
+    return screen_fund(d) if d["kind"] == "fund" else screen(d)
+
+
 # ----------------------------------------------------------------------------- display helpers
 def verdict_card(d, s):
     label, bg, fg, action = TIER_STYLE[s["tier"]]
-    tier_txt = "" if s["tier"] == "Incomplete" else f" · {s['tier']}"
+    action = s.get("action") or action
+    tier_txt = "" if s["tier"] == "Incomplete" or s.get("islamic") else f" · {s['tier']}"
     st.markdown(f"""
     <div class="verdict" style="background:{bg};color:{fg}">
       <div class="label">{label}</div>
       <div class="action">{action}</div>
       <div class="who">{html.escape(d['name'])} ({html.escape(d['symbol'])}){tier_txt}</div>
     </div>""", unsafe_allow_html=True)
-    if s["business"] == "Review":
-        st.markdown(f'<div class="note">{html.escape(s["why"])}</div>', unsafe_allow_html=True)
+    note = s["why"] if s["business"] == "Review" else s.get("note")
+    if note:
+        st.markdown(f'<div class="note">{html.escape(note)}</div>', unsafe_allow_html=True)
 
 
 def ratio_bar(name, value):
@@ -316,6 +427,32 @@ def standards_table(s):
                "Every standard also needs under 5% non-permissible revenue. "
                "\"Cash\" here is all of the company's cash; the standards only count interest-earning cash, "
                "so cash-rich companies can look worse than they really are.")
+
+
+def fund_detail(d, s):
+    st.subheader("Why")
+    st.write(s["why"])
+    if s["rows"]:
+        st.subheader("What's inside")
+        st.caption(f"The {len(s['rows'])} biggest holdings Yahoo Finance publishes, each checked with the family rules.")
+        st.dataframe(pd.DataFrame(s["rows"]), hide_index=True, width="stretch",
+                     column_config={"Weight": st.column_config.NumberColumn("Share of fund", format="%.1f%%")})
+
+    st.subheader("Cleaning dividends")
+    if s["checked"]:
+        already = " if the fund doesn't already do this for you" if s["islamic"] else ""
+        st.write(f"Give **{s['purge_pct']:.2%}** of every distribution from this fund to charity{already} "
+                 f"({s['purge_source']}).")
+    else:
+        st.write("Can't be worked out without the fund's holdings.")
+
+    with st.expander("More detail"):
+        sectors = sorted(d["sectors"].items(), key=lambda kv: -kv[1])
+        if sectors:
+            st.write("Sectors: " + " · ".join(f"{k.replace('_', ' ').title()} {v:.0%}" for k, v in sectors))
+        st.write(f"Bonds: {d['bonds']:.0%} of the fund")
+        st.caption("Only the biggest holdings that Yahoo Finance publishes can be checked. "
+                   "For the full list, see the fund's own website.")
 
 
 def money(x, ccy=""):
@@ -372,26 +509,31 @@ def write_holdings(df):
 # ----------------------------------------------------------------------------- pages
 st.title("Shariah Stock Checker")
 
-tab_check, tab_mine, tab_how = st.tabs(["Check a stock", "My holdings", "How it works"])
+tab_check, tab_mine, tab_how = st.tabs(["Check a stock or ETF", "My holdings", "How it works"])
 
 with tab_check:
-    query = st.text_input("Company name or share code", placeholder="e.g. Woolworths, BHP.AX, Apple")
+    query = st.text_input("Company, ETF or share code", placeholder="e.g. Woolworths, BHP.AX, Apple, SPUS")
     if query:
         matches = search(query.strip())
         exact = query.strip().upper()
         if (not matches and "." in exact) or (matches and exact in [m[0] for m in matches]):
             symbol = exact
         elif matches:
-            symbol = st.selectbox("Pick the company", matches, format_func=lambda m: m[1])[0]
+            symbol = st.selectbox("Pick the company or ETF", matches, format_func=lambda m: m[1])[0]
         else:
             symbol = None
-            st.warning("No companies found. Try the company's full name, or its share code (ASX codes end in .AX).")
+            st.warning("Nothing found. Try the full name, or the share code (ASX codes end in .AX).")
 
         if symbol:
-            with st.spinner("Checking the company's figures…"):
+            with st.spinner("Checking the figures…"):
                 d, err = get_data(symbol)
             if err:
                 st.error(err)
+            elif d["kind"] == "fund":
+                with st.spinner("Checking what the fund holds…"):
+                    s = screen_fund(d)
+                verdict_card(d, s)
+                fund_detail(d, s)
             else:
                 s = screen(d)
                 verdict_card(d, s)
@@ -426,7 +568,7 @@ with tab_mine:
         edited = st.data_editor(
             holdings, num_rows="dynamic", width="stretch", hide_index=True,
             column_config={
-                "Code": st.column_config.TextColumn("Code", help="Share code, e.g. BHP.AX"),
+                "Code": st.column_config.TextColumn("Code", help="Share or ETF code, e.g. BHP.AX"),
                 "Shares": st.column_config.NumberColumn("Shares", min_value=0, step=1),
                 "Dividend per share (last 12 months)": st.column_config.NumberColumn("Dividend per share (last 12 months)", min_value=0, format="%.4f",
                                                                                      help="Leave blank to use Yahoo Finance's figure"),
@@ -443,7 +585,7 @@ with tab_mine:
         if err:
             st.warning(err)
             continue
-        s = screen(d)
+        s = evaluate(d)
         shares = float(h["Shares"] or 0)
         value = shares * d["price"]
         dps = h["Dividend per share (last 12 months)"]
@@ -470,6 +612,7 @@ with tab_mine:
 
         for r in rows:
             label, bg, fg, action = TIER_STYLE[r["s"]["tier"]]
+            action = r["s"].get("action") or action
             flag = " · business not checked yet" if r["s"]["business"] == "Review" else ""
             st.markdown(f"""
             <div class="verdict" style="background:{bg};color:{fg};padding:0.9rem 1.1rem;margin:0.5rem 0">
@@ -511,6 +654,12 @@ its interest-bearing debt, its cash and interest-earning investments, and the mo
 
 **5. Yearly review** on the last day of Sha'ban: re-check holdings, give dividend cleaning amounts,
 and pay zakat of 2.5% on compliant and on-watch holdings.
+
+**6. ETFs.** The app looks through to the biggest holdings Yahoo Finance publishes and checks each one
+with the rules above. An ETF is not compliant if any of them fails, or if more than 1% of it is in bonds.
+If they all pass but don't make up the whole fund, it shows "Can't tell yet", because the rest can't be seen.
+Funds with Islamic, Shariah or Halal in their name have their own Shariah board, so they're shown as compliant,
+with the family-rule check of their holdings alongside. Dividend cleaning uses the average of the holdings checked.
 
 **How the family rules compare with the main standards.** Our rules are closest to Dow Jones Islamic
 (same 2-year average), but stricter: on-watch starts at 30%. Each stock's

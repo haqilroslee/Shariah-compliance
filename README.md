@@ -44,6 +44,12 @@ receivables tests in September 2023. Once you've confirmed that in the S&P metho
 
 Dividends left blank in **My holdings** are filled in from Yahoo Finance (last 12 months).
 
+## ETFs
+ETFs can be checked like stocks and added to **My holdings**. The app screens the top holdings Yahoo Finance
+publishes (usually the biggest 10). A normal ETF fails if any of them fails or it holds bonds, and shows
+"Can't tell yet" if they pass but don't cover the whole fund. Funds with Islamic, Shariah, Sharia, Syariah
+or Halal in their name are treated as screened by their own Shariah board (`ISLAMIC_FUND_WORDS` in `app.py`).
+
 ## If it stops showing figures
 Yahoo Finance sometimes blocks requests from cloud servers. If every stock fails for more than a day,
 the fix is switching to a paid data source, which is a small code change.
