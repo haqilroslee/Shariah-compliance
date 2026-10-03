@@ -73,7 +73,8 @@ website and a Google search for its annual report, for checking the figures by h
 Yahoo Finance only lists an ETF's top 10 holdings. The app uses the provider's full holdings list instead when it
 can: a file uploaded on the ETF's page (for that visit), a file saved in `etf_holdings/` (permanent; see the
 README in that folder for Vanguard, BetaShares and SPDR download steps), or, for US SPDR ETFs such as SPY, the
-daily file downloaded automatically from State Street. It checks the largest holdings until `ETF_FULL_TARGET`
+daily file downloaded automatically from State Street (and BetaShares' file for BetaShares ETFs). A GitHub Action
+refreshes the funds listed in `etf_holdings/sources.csv` every weekday night; see `etf_holdings/README.md`. It checks the largest holdings until `ETF_FULL_TARGET`
 (95%) of the fund is covered, up to `ETF_FULL_MAX` (150) holdings.
 
 ## Prices and currency

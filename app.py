@@ -18,6 +18,7 @@ from datetime import date, datetime
 import pandas as pd
 import streamlit as st
 import yfinance as yf
+from holdings import parse_holdings_file, yahoo_candidates
 from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
 
 # ----------------------------------------------------------------------------- settings
@@ -45,6 +46,7 @@ ETF_FULL_TARGET = 0.95
 ETF_FULL_MAX = 150
 HOLDINGS_DIR = "etf_holdings"
 SPDR_HOLDINGS_URL = "https://www.ssga.com/us/en/intermediary/etfs/library-content/products/fund-data/etfs/us/holdings-daily-us-en-{}.xlsx"
+BETASHARES_HOLDINGS_URL = "https://www.betashares.com.au/files/csv/{}_Portfolio_Holdings.csv"
 # "Find stocks" tab: the largest companies in a market are screened, then the best compliant ones listed
 IDEAS_MARKETS = {"Australia (ASX)": "au", "United States": "us", "Malaysia (Bursa)": "my"}
 IDEAS_CANDIDATES = 100    # how many of the largest companies to screen (more = slower first load)
@@ -541,126 +543,6 @@ def screen(d):
 
 
 # ----------------------------------------------------------------------------- full ETF holdings files
-# Exchange codes used in provider files (Bloomberg style, e.g. "BHP AU") and countries -> Yahoo code endings
-EXCHANGE_SUFFIX = {"AU": ".AX", "AT": ".AX", "US": "", "UN": "", "UW": "", "UQ": "", "UP": "", "UA": "", "LN": ".L",
-                   "JP": ".T", "JT": ".T", "HK": ".HK", "CN": ".TO", "CT": ".TO", "GR": ".DE", "GY": ".DE", "FP": ".PA",
-                   "NA": ".AS", "SW": ".SW", "SE": ".SW", "SS": ".ST", "DC": ".CO", "SM": ".MC", "IM": ".MI", "KS": ".KS",
-                   "TT": ".TW", "SP": ".SI", "MK": ".KL", "NZ": ".NZ", "BB": ".BR", "FH": ".HE", "NO": ".OL", "ID": ".IR"}
-COUNTRY_SUFFIX = {"australia": ".AX", "united states": "", "united states of america": "", "usa": "", "us": "",
-                  "united kingdom": ".L", "uk": ".L", "japan": ".T", "hong kong": ".HK", "canada": ".TO", "germany": ".DE",
-                  "france": ".PA", "netherlands": ".AS", "switzerland": ".SW", "sweden": ".ST", "denmark": ".CO",
-                  "spain": ".MC", "italy": ".MI", "korea": ".KS", "south korea": ".KS", "korea, republic of": ".KS",
-                  "taiwan": ".TW", "singapore": ".SI", "malaysia": ".KL", "new zealand": ".NZ", "belgium": ".BR",
-                  "finland": ".HE", "norway": ".OL", "ireland": ".IR"}
-TICKER_COLS = {"ticker", "code", "asx code", "symbol", "ticker symbol", "security code", "exchange ticker", "local ticker",
-               "bloomberg ticker", "stock code", "ticker code"}
-NAME_COLS = {"name", "holding", "holding name", "holdings", "security name", "security", "description",
-             "security description", "company", "company name", "issuer name", "issuer", "stock", "asset name"}
-CLASS_COLS = {"asset class", "security type", "asset type", "type", "sector", "asset class category", "instrument type"}
-NOT_SHARES = re.compile(r"\b(cash|futures?|forwards?|currency|currencies|margin|unsettled|receivables?|payables?|"
-                        r"money market|swaps?|options?|derivatives?|fx)\b", re.I)
-
-
-def _norm(cell):
-    return re.sub(r"[^a-z%]+", " ", str(cell).lower()).strip()
-
-
-def _is_weight_col(n):
-    return n in {"weight", "weight %", "weighting", "% weight", "% of net assets", "% net assets", "% of fund",
-                 "% of funds", "portfolio weight", "market value %", "% of market value"} or \
-        "weight" in n or ("%" in n and any(w in n for w in ("net assets", "fund", "portfolio", "market value")))
-
-
-def _rows_from_file(data, filename):
-    """All rows of a CSV or Excel file as lists of strings (first sheet that has a holdings table)."""
-    if filename.lower().endswith((".xlsx", ".xls")):
-        sheets = pd.read_excel(io.BytesIO(data), header=None, sheet_name=None, dtype=str)
-        return [[("" if pd.isna(c) else str(c)) for c in row] for df in sheets.values() for row in df.itertuples(index=False)]
-    text = data.decode("utf-8-sig", errors="replace")
-    delim = max([",", ";", "\t"], key=lambda d: text[:5000].count(d))
-    return [row for row in csv.reader(io.StringIO(text), delimiter=delim)]
-
-
-def parse_holdings_file(data, filename):
-    """Read a provider's full holdings file (Vanguard, BetaShares, SPDR and similar layouts).
-
-    Returns {"entries": [{"ticker", "name", "weight", "country", "cash"}], "as_of": text or ""}.
-    Raises ValueError if no holdings table can be found."""
-    rows = _rows_from_file(data, filename)
-    header_at, cols = None, {}
-    for i, row in enumerate(rows[:60]):
-        names = [_norm(c) for c in row]
-        weight = next((j for j, n in enumerate(names) if _is_weight_col(n)), None)
-        ticker = next((j for j, n in enumerate(names) if n in TICKER_COLS), None)
-        name = next((j for j, n in enumerate(names) if n in NAME_COLS), None)
-        if weight is not None and (ticker is not None or name is not None):
-            header_at = i
-            cols = {"weight": weight, "ticker": ticker, "name": name,
-                    "country": next((j for j, n in enumerate(names) if "country" in n or n == "location"), None),
-                    "class": next((j for j, n in enumerate(names) if n in CLASS_COLS), None)}
-            break
-    if header_at is None:
-        raise ValueError("couldn't find a table with holding names and weights in this file")
-
-    def cell(row, key):
-        j = cols[key]
-        return row[j].strip() if j is not None and j < len(row) else ""
-
-    as_of = ""
-    for row in rows[:header_at]:
-        m = re.search(r"\bas (?:of|at)\b[:\s]*([0-9A-Za-z ,/\-]{6,20})", " ".join(row), re.I)
-        if m:
-            as_of = m.group(1).strip(" ,")
-            break
-    entries = []
-    for row in rows[header_at + 1:]:
-        raw = cell(row, "weight").replace("%", "").replace(",", "").strip()
-        if raw.startswith("(") and raw.endswith(")"):
-            raw = "-" + raw[1:-1]
-        try:
-            weight = float(raw)
-        except ValueError:
-            continue
-        ticker, name, klass = cell(row, "ticker"), cell(row, "name"), cell(row, "class")
-        if not ticker and not name:
-            continue
-        cash = bool(NOT_SHARES.search(klass) or (NOT_SHARES.search(name) and not ticker.strip("- ")) or
-                    ticker.upper() in {"CASH", "-", "--", "N/A"} or re.search(r"\b(cash|futures?|currency)\b", name, re.I))
-        entries.append({"ticker": "" if ticker in {"-", "--"} else ticker, "name": name or ticker, "weight": weight,
-                        "country": cell(row, "country"), "cash": cash})
-    if not entries:
-        raise ValueError("found the table but no holdings with weights")
-    total = sum(e["weight"] for e in entries)
-    if total > 1.5:   # weights given as percentages
-        for e in entries:
-            e["weight"] /= 100
-    return {"entries": entries, "as_of": as_of}
-
-
-def yahoo_candidates(ticker, country, fund_symbol):
-    """Yahoo codes to try for a holding: handles "BHP AU", "BRK.B", country columns and missing exchange endings."""
-    parts = ticker.upper().replace(" EQUITY", "").split()
-    if not parts:
-        return []
-    base, suffix = parts[0], None
-    if len(parts) >= 2 and parts[-1] in EXCHANGE_SUFFIX:
-        suffix = EXCHANGE_SUFFIX[parts[-1]]
-    elif "." in base and base.rsplit(".", 1)[1] in {"AX", "L", "T", "HK", "TO", "DE", "PA", "AS", "SW", "KL", "SI", "NZ"}:
-        return [base]   # already a Yahoo code
-    if suffix is None and country:
-        suffix = COUNTRY_SUFFIX.get(country.strip().lower())
-    us = base.replace(".", "-").replace("/", "-")
-    if suffix == "":
-        return [us]
-    if suffix is not None:
-        if suffix == ".HK" and base.isdigit():
-            base = base.zfill(4)
-        return [base.replace("/", "-") + suffix]
-    if "." in fund_symbol:   # local fund, local holdings listed without their exchange ending (CBA rather than CBA.AX)
-        return [base + fund_symbol[fund_symbol.rfind("."):], us]
-    return [us]
-
-
 @st.cache_data(ttl=12 * 3600, show_spinner=False)
 def download_file(url):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (WattleFolio Shariah Checker)"})
@@ -691,14 +573,20 @@ def saved_holdings(symbol):
 
 
 def provider_holdings(f):
-    """Download the full list straight from the provider where that's automatic (SPDR / State Street US ETFs)."""
+    """Download the full list straight from the provider where there's a fixed link: SPDR (US) and BetaShares (ASX).
+
+    Returns (parsed file, provider name) or (None, "")."""
     sym, family = f["symbol"], (f.get("family") or "").lower()
-    if "." in sym or not ("spdr" in family or "state street" in family or sym.upper() in {"SPY", "SPLG", "MDY", "DIA"}):
-        return None
+    if "." not in sym and ("spdr" in family or "state street" in family or sym.upper() in {"SPY", "SPLG", "MDY", "DIA"}):
+        url, fn, who = SPDR_HOLDINGS_URL.format(sym.lower()), "spdr.xlsx", "State Street SPDR's daily holdings file"
+    elif sym.upper().endswith(".AX") and "betashares" in family.replace(" ", ""):
+        url, fn, who = BETASHARES_HOLDINGS_URL.format(sym.split(".")[0].upper()), "betashares.csv", "BetaShares' holdings file"
+    else:
+        return None, ""
     try:
-        return parse_holdings_file(download_file(SPDR_HOLDINGS_URL.format(sym.lower())), "spdr.xlsx")
+        return parse_holdings_file(download_file(url), fn), who
     except Exception:
-        return None
+        return None, ""
 
 
 def fund_holdings(f, allow_upload=True):
@@ -709,9 +597,9 @@ def fund_holdings(f, allow_upload=True):
     saved, fn = saved_holdings(f["symbol"])
     if saved:
         return saved["entries"], f"the saved holdings file ({fn})", saved["as_of"], True
-    auto = provider_holdings(f)
+    auto, who = provider_holdings(f)
     if auto:
-        return auto["entries"], "State Street SPDR's daily holdings file", auto["as_of"], True
+        return auto["entries"], who, auto["as_of"], True
     return ([{"ticker": t, "name": n, "weight": w, "country": "", "cash": False} for t, n, w in f["holdings"]],
             "Yahoo Finance (top holdings only)", "", False)
 
@@ -1564,8 +1452,8 @@ Each ETF also shows how much of the fund (by weight) is compliant, needs review,
 checked, or isn't listed by Yahoo.
 
 **Full ETF holdings.** Yahoo Finance only lists an ETF's top 10 holdings. When the fund provider's full holdings
-file is available (uploaded on the ETF's page, saved in the app, or downloaded automatically for SPDR ETFs like
-SPY), the app checks the largest holdings until 95% of the fund is covered, up to 150 holdings. Cash and futures
+file is available (uploaded on the ETF's page, saved in the app and refreshed each night, or downloaded
+automatically for SPDR and BetaShares ETFs), the app checks the largest holdings until 95% of the fund is covered, up to 150 holdings. Cash and futures
 are shown separately. An ETF checked this way can be compliant if everything checked passes.
 
 **7. Find stocks.** Lists the largest companies in a market that pass the WattleFolio rules, sorted by the
