@@ -62,47 +62,83 @@ DESCRIPTION_FLAGS = ["alcohol*", "liquor*", "beer*", "wine*", "spirits", "brew*"
 
 MINOR_UNITS = {"GBp": ("GBP", 100), "GBX": ("GBP", 100), "ZAc": ("ZAR", 100), "ILA": ("ILS", 100)}
 
+# WattleFolio design tokens for the parts Streamlit's theme doesn't colour (verdicts, badges, cards, bars)
+PALETTES = {
+    "light": {"ink": "#2d4039", "muted": "#5f6e68", "primary": "#35645a", "accent": "#f4ddae", "surface": "#ffffff",
+              "line": "#dfe8e1", "bar": "#e2f1ed", "good": "#15805d", "watch": "#dfbd78", "bad": "#c2413a",
+              "note-bg": "#fffbed", "note-line": "#dfbd78", "edge": "rgba(45,64,57,0.08)",
+              "shadow": "0 1px 2px rgba(38,70,61,0.035), 0 12px 30px rgba(56,87,77,0.07)",
+              "t1-bg": "#ecfdf5", "t1-fg": "#126247", "t2-bg": "#fff9e8", "t2-fg": "#8b5b12",
+              "t3-bg": "#fff1f0", "t3-fg": "#a8352f", "t0-bg": "#f8f7f5", "t0-fg": "#5f6e68"},
+    "dark": {"ink": "#eae8df", "muted": "#a7b1ac", "primary": "#99c2b7", "accent": "#c39f52", "surface": "#161e1b",
+             "line": "#2b3431", "bar": "#1d2e2a", "good": "#75cda3", "watch": "#c39f52", "bad": "#ef8a82",
+             "note-bg": "#352a11", "note-line": "#6a5526", "edge": "rgba(255,255,255,0.06)",
+             "shadow": "0 1px 2px rgba(0,0,0,0.36), 0 12px 30px rgba(0,0,0,0.34)",
+             "t1-bg": "#0e3222", "t1-fg": "#77d4a8", "t2-bg": "#302816", "t2-fg": "#edc56e",
+             "t3-bg": "#44211e", "t3-fg": "#ef8a82", "t0-bg": "#1e2623", "t0-fg": "#a7b1ac"},
+}
+
+
+def theme_mode():
+    """"light" or "dark" as Streamlit is showing it, or None if it can't tell (then the device setting decides)."""
+    try:
+        mode = st.context.theme.type
+    except Exception:
+        return None
+    return mode if mode in PALETTES else None
+
+
+def theme_css():
+    def block(mode):
+        return ":root{" + ";".join(f"--wf-{k}:{v}" for k, v in PALETTES[mode].items()) + "}"
+    mode = theme_mode()
+    if mode:
+        return block(mode)
+    return block("light") + "@media (prefers-color-scheme: dark){" + block("dark") + "}"
+
+
 TIER_STYLE = {
-    "Tier 1": ("Compliant", "#ecfdf5", "#126247", "Fine to hold and to buy more."),
-    "Tier 2": ("On watch", "#fff9e8", "#8b5b12", "Keep the shares you have, but don't buy more for now."),
-    "Tier 3": ("Not compliant", "#fff1f0", "#a8352f", f"Don't buy. Sell existing shares within {EXIT_DAYS} days."),
-    "Incomplete": ("Can't tell yet", "#f8f7f5", "#5f6e68", "Some company figures are missing, so this stock can't be scored."),
+    "Tier 1": ("Compliant", "var(--wf-t1-bg)", "var(--wf-t1-fg)", "Fine to hold and to buy more."),
+    "Tier 2": ("On watch", "var(--wf-t2-bg)", "var(--wf-t2-fg)", "Keep the shares you have, but don't buy more for now."),
+    "Tier 3": ("Not compliant", "var(--wf-t3-bg)", "var(--wf-t3-fg)", f"Don't buy. Sell existing shares within {EXIT_DAYS} days."),
+    "Incomplete": ("Can't tell yet", "var(--wf-t0-bg)", "var(--wf-t0-fg)", "Some company figures are missing, so this stock can't be scored."),
 }
 
 st.set_page_config(page_title="WattleFolio Shariah Checker", page_icon="assets/wattlefolio-mark.png", layout="centered")
+st.markdown(f"<style>{theme_css()}</style>", unsafe_allow_html=True)
 st.markdown("""
 <style>
 html, body, [class*="css"] { font-size: 18px; }
 html, body, .stApp, .stApp p, .stApp li, .stApp input, .stApp button, .stApp label,
 .stApp h1, .stApp h2, .stApp h3, .stApp [data-testid="stMarkdownContainer"] {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, system-ui, sans-serif; }
-.stApp h1, .stApp h2, .stApp h3 { color: #2d4039; letter-spacing: -0.01em; }
+.stApp h1, .stApp h2, .stApp h3 { color: var(--wf-ink); letter-spacing: -0.01em; }
 .brand { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; margin: 0 0 0.6rem; }
 .brand img { height: 40px; width: auto; }
-.brand span { font-size: 1.05rem; font-weight: 600; color: #35645a; border-left: 2px solid #f4ddae; padding-left: 0.75rem; }
-.verdict { border-radius: 8px; padding: 1.4rem 1.5rem; margin: 0.8rem 0 1.2rem; border: 1px solid rgba(45,64,57,0.08);
-           box-shadow: 0 1px 2px rgba(38,70,61,0.035), 0 12px 30px rgba(56,87,77,0.07); }
+.brand span { font-size: 1.05rem; font-weight: 600; color: var(--wf-primary); border-left: 2px solid var(--wf-accent); padding-left: 0.75rem; }
+.verdict { border-radius: 8px; padding: 1.4rem 1.5rem; margin: 0.8rem 0 1.2rem; border: 1px solid var(--wf-edge);
+           box-shadow: var(--wf-shadow); }
 .verdict .label { font-size: 2.3rem; font-weight: 750; line-height: 1.1; letter-spacing: -0.01em; }
 .verdict .action { font-size: 1.2rem; margin-top: 0.4rem; }
 .verdict .who { font-size: 0.95rem; margin-top: 0.9rem; opacity: 0.8; }
-.note { border-left: 4px solid #dfbd78; background: #fffbed; padding: 0.5rem 0.9rem; margin: 0.4rem 0 1rem; }
-.bar { position: relative; height: 12px; border-radius: 6px; background: #e2f1ed; margin: 0.25rem 0 0.9rem; }
+.note { border-left: 4px solid var(--wf-note-line); background: var(--wf-note-bg); padding: 0.5rem 0.9rem; margin: 0.4rem 0 1rem; }
+.bar { position: relative; height: 12px; border-radius: 6px; background: var(--wf-bar); margin: 0.25rem 0 0.9rem; }
 .bar .fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 6px; }
-.bar .tick { position: absolute; top: -4px; bottom: -4px; width: 2px; background: #5f6e68; }
+.bar .tick { position: absolute; top: -4px; bottom: -4px; width: 2px; background: var(--wf-muted); }
 .row { display: flex; justify-content: space-between; font-size: 1rem; }
 .src { font-size: 0.85rem; opacity: 0.8; margin: -0.6rem 0 1rem; line-height: 1.5; }
 .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 0.75rem; margin: 0.5rem 0 1rem; }
-.card { border: 1px solid #dfe8e1; border-radius: 8px; padding: 0.8rem 1rem; background: #ffffff;
-        box-shadow: 0 1px 2px rgba(38,70,61,0.035); }
+.card { border: 1px solid var(--wf-line); border-radius: 8px; padding: 0.8rem 1rem; background: var(--wf-surface);
+        box-shadow: 0 1px 2px rgba(0,0,0,0.04); }
 .card .head { display: flex; justify-content: space-between; align-items: center; gap: 0.5rem; font-weight: 700; }
 .card .sub { font-size: 0.85rem; opacity: 0.75; margin: 0.1rem 0 0.4rem; }
 .card .line { display: flex; justify-content: space-between; gap: 0.75rem; font-size: 0.95rem; padding: 0.15rem 0; }
 .card .line span:last-child { text-align: right; }
-.card .line.bad span:last-child { color: #c2413a; font-weight: 700; }
+.card .line.bad span:last-child { color: var(--wf-bad); font-weight: 700; }
 .card small { opacity: 0.7; }
 .pill { display: inline-block; border-radius: 999px; padding: 0.1rem 0.6rem; font-size: 0.8rem; font-weight: 600; white-space: nowrap; }
 .holding { display: flex; justify-content: space-between; align-items: flex-start; gap: 0.75rem; padding: 0.55rem 0;
-           border-bottom: 1px solid #dfe8e1; }
+           border-bottom: 1px solid var(--wf-line); }
 .holding .nm { font-weight: 600; overflow-wrap: anywhere; }
 .holding .meta { font-size: 0.85rem; margin-top: 0.2rem; display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; }
 .holding .wt { font-weight: 600; white-space: nowrap; }
@@ -580,7 +616,7 @@ def ratio_bar(name, value):
     if value is None:
         st.markdown(f'<div class="row"><span>{name}</span><span>missing</span></div>', unsafe_allow_html=True)
         return
-    colour = "#15805d" if value <= TIER1_MAX else "#dfbd78" if value <= TIER2_MAX else "#c2413a"
+    colour = "var(--wf-good)" if value <= TIER1_MAX else "var(--wf-watch)" if value <= TIER2_MAX else "var(--wf-bad)"
     width = min(value / 0.5, 1) * 100   # bar spans 0-50%
     st.markdown(f"""
     <div class="row"><span>{name}</span><span><b>{value:.1%}</b></span></div>
@@ -768,14 +804,25 @@ def write_holdings(df):
 
 
 # ----------------------------------------------------------------------------- pages
+@st.cache_data
+def image_uri(path):
+    with open(path, "rb") as f:
+        return "data:image/png;base64," + base64.b64encode(f.read()).decode()
+
+
 def brand_header():
     try:
-        with open("assets/wattlefolio-logo.png", "rb") as f:
-            logo = base64.b64encode(f.read()).decode()
-        st.markdown(f'<div class="brand"><img src="data:image/png;base64,{logo}" alt="WattleFolio">'
-                    f'<span>Shariah Checker</span></div>', unsafe_allow_html=True)
+        light, dark = image_uri("assets/wattlefolio-logo.png"), image_uri("assets/wattlefolio-logo-dark.png")
     except OSError:
         st.title("WattleFolio Shariah Checker")
+        return
+    mode = theme_mode()
+    if mode:
+        logo = f'<img src="{dark if mode == "dark" else light}" alt="WattleFolio">'
+    else:
+        logo = (f'<picture><source srcset="{dark}" media="(prefers-color-scheme: dark)">'
+                f'<img src="{light}" alt="WattleFolio"></picture>')
+    st.markdown(f'<div class="brand">{logo}<span>Shariah Checker</span></div>', unsafe_allow_html=True)
 
 
 brand_header()

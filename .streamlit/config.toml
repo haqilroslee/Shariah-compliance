@@ -1,10 +1,19 @@
-# WattleFolio theme (colours from the WattleFolio design tokens)
+# WattleFolio theme (colours from the WattleFolio design tokens).
+# Follows the device's light/dark setting; viewers can also switch in the app menu (⋮ > Settings).
 [theme]
-base = "light"
+font = "sans serif"
+baseRadius = "0.5rem"
+
+[theme.light]
 primaryColor = "#35645a"
 backgroundColor = "#f7f4ea"
 secondaryBackgroundColor = "#f0f7f5"
 textColor = "#2d4039"
-font = "sans serif"
 borderColor = "#dfe8e1"
-baseRadius = "0.5rem"
+
+[theme.dark]
+primaryColor = "#78aca0"
+backgroundColor = "#0b1210"
+secondaryBackgroundColor = "#1e2623"
+textColor = "#eae8df"
+borderColor = "#2b3431"
