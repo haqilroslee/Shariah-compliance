@@ -3,6 +3,7 @@ WattleFolio Shariah Checker: screens shares and ETFs for Shariah compliance.
 Screening rules follow the WattleFolio methodology (tiers at 30% / 33%, 5% revenue limit,
 24-month average market cap, 60-day exit window, purging, 2.5% zakat).
 """
+import base64
 import html
 import math
 import re
@@ -62,37 +63,46 @@ DESCRIPTION_FLAGS = ["alcohol*", "liquor*", "beer*", "wine*", "spirits", "brew*"
 MINOR_UNITS = {"GBp": ("GBP", 100), "GBX": ("GBP", 100), "ZAc": ("ZAR", 100), "ILA": ("ILS", 100)}
 
 TIER_STYLE = {
-    "Tier 1": ("Compliant", "#E3F1E8", "#14532D", "Fine to hold and to buy more."),
-    "Tier 2": ("On watch", "#FBF0D9", "#7A4B00", "Keep the shares you have, but don't buy more for now."),
-    "Tier 3": ("Not compliant", "#F8E1DE", "#8A1C12", f"Don't buy. Sell existing shares within {EXIT_DAYS} days."),
-    "Incomplete": ("Can't tell yet", "#ECEEF0", "#33414D", "Some company figures are missing, so this stock can't be scored."),
+    "Tier 1": ("Compliant", "#ecfdf5", "#126247", "Fine to hold and to buy more."),
+    "Tier 2": ("On watch", "#fff9e8", "#8b5b12", "Keep the shares you have, but don't buy more for now."),
+    "Tier 3": ("Not compliant", "#fff1f0", "#a8352f", f"Don't buy. Sell existing shares within {EXIT_DAYS} days."),
+    "Incomplete": ("Can't tell yet", "#f8f7f5", "#5f6e68", "Some company figures are missing, so this stock can't be scored."),
 }
 
-st.set_page_config(page_title="WattleFolio Shariah Checker", page_icon="🌙", layout="centered")
+st.set_page_config(page_title="WattleFolio Shariah Checker", page_icon="assets/wattlefolio-mark.png", layout="centered")
 st.markdown("""
 <style>
 html, body, [class*="css"] { font-size: 18px; }
-.verdict { border-radius: 14px; padding: 1.4rem 1.5rem; margin: 0.8rem 0 1.2rem; }
+html, body, .stApp, .stApp p, .stApp li, .stApp input, .stApp button, .stApp label,
+.stApp h1, .stApp h2, .stApp h3, .stApp [data-testid="stMarkdownContainer"] {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, system-ui, sans-serif; }
+.stApp h1, .stApp h2, .stApp h3 { color: #2d4039; letter-spacing: -0.01em; }
+.brand { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; margin: 0 0 0.6rem; }
+.brand img { height: 40px; width: auto; }
+.brand span { font-size: 1.05rem; font-weight: 600; color: #35645a; border-left: 2px solid #f4ddae; padding-left: 0.75rem; }
+.verdict { border-radius: 8px; padding: 1.4rem 1.5rem; margin: 0.8rem 0 1.2rem; border: 1px solid rgba(45,64,57,0.08);
+           box-shadow: 0 1px 2px rgba(38,70,61,0.035), 0 12px 30px rgba(56,87,77,0.07); }
 .verdict .label { font-size: 2.3rem; font-weight: 750; line-height: 1.1; letter-spacing: -0.01em; }
 .verdict .action { font-size: 1.2rem; margin-top: 0.4rem; }
 .verdict .who { font-size: 0.95rem; margin-top: 0.9rem; opacity: 0.8; }
-.note { border-left: 4px solid #C98A00; padding: 0.5rem 0.9rem; margin: 0.4rem 0 1rem; }
-.bar { position: relative; height: 12px; border-radius: 6px; background: rgba(128,128,128,0.18); margin: 0.25rem 0 0.9rem; }
+.note { border-left: 4px solid #dfbd78; background: #fffbed; padding: 0.5rem 0.9rem; margin: 0.4rem 0 1rem; }
+.bar { position: relative; height: 12px; border-radius: 6px; background: #e2f1ed; margin: 0.25rem 0 0.9rem; }
 .bar .fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 6px; }
-.bar .tick { position: absolute; top: -4px; bottom: -4px; width: 2px; background: rgba(128,128,128,0.8); }
+.bar .tick { position: absolute; top: -4px; bottom: -4px; width: 2px; background: #5f6e68; }
 .row { display: flex; justify-content: space-between; font-size: 1rem; }
 .src { font-size: 0.85rem; opacity: 0.8; margin: -0.6rem 0 1rem; line-height: 1.5; }
 .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 0.75rem; margin: 0.5rem 0 1rem; }
-.card { border: 1px solid rgba(128,128,128,0.3); border-radius: 12px; padding: 0.8rem 1rem; }
+.card { border: 1px solid #dfe8e1; border-radius: 8px; padding: 0.8rem 1rem; background: #ffffff;
+        box-shadow: 0 1px 2px rgba(38,70,61,0.035); }
 .card .head { display: flex; justify-content: space-between; align-items: center; gap: 0.5rem; font-weight: 700; }
 .card .sub { font-size: 0.85rem; opacity: 0.75; margin: 0.1rem 0 0.4rem; }
 .card .line { display: flex; justify-content: space-between; gap: 0.75rem; font-size: 0.95rem; padding: 0.15rem 0; }
 .card .line span:last-child { text-align: right; }
-.card .line.bad span:last-child { color: #E5484D; font-weight: 700; }
+.card .line.bad span:last-child { color: #c2413a; font-weight: 700; }
 .card small { opacity: 0.7; }
 .pill { display: inline-block; border-radius: 999px; padding: 0.1rem 0.6rem; font-size: 0.8rem; font-weight: 600; white-space: nowrap; }
 .holding { display: flex; justify-content: space-between; align-items: flex-start; gap: 0.75rem; padding: 0.55rem 0;
-           border-bottom: 1px solid rgba(128,128,128,0.2); }
+           border-bottom: 1px solid #dfe8e1; }
 .holding .nm { font-weight: 600; overflow-wrap: anywhere; }
 .holding .meta { font-size: 0.85rem; margin-top: 0.2rem; display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; }
 .holding .wt { font-weight: 600; white-space: nowrap; }
@@ -100,6 +110,8 @@ html, body, [class*="css"] { font-size: 18px; }
   html, body, [class*="css"] { font-size: 16px; }
   .verdict { padding: 1.1rem 1.2rem; }
   .verdict .label { font-size: 1.8rem; }
+  .brand { flex-direction: column; align-items: flex-start; gap: 0.25rem; }
+  .brand span { border-left: none; padding-left: 0; }
   .verdict .action { font-size: 1.05rem; }
 }
 </style>
@@ -568,7 +580,7 @@ def ratio_bar(name, value):
     if value is None:
         st.markdown(f'<div class="row"><span>{name}</span><span>missing</span></div>', unsafe_allow_html=True)
         return
-    colour = "#2E7D4F" if value <= TIER1_MAX else "#C98A00" if value <= TIER2_MAX else "#B3261E"
+    colour = "#15805d" if value <= TIER1_MAX else "#dfbd78" if value <= TIER2_MAX else "#c2413a"
     width = min(value / 0.5, 1) * 100   # bar spans 0-50%
     st.markdown(f"""
     <div class="row"><span>{name}</span><span><b>{value:.1%}</b></span></div>
@@ -756,7 +768,17 @@ def write_holdings(df):
 
 
 # ----------------------------------------------------------------------------- pages
-st.title("WattleFolio Shariah Checker")
+def brand_header():
+    try:
+        with open("assets/wattlefolio-logo.png", "rb") as f:
+            logo = base64.b64encode(f.read()).decode()
+        st.markdown(f'<div class="brand"><img src="data:image/png;base64,{logo}" alt="WattleFolio">'
+                    f'<span>Shariah Checker</span></div>', unsafe_allow_html=True)
+    except OSError:
+        st.title("WattleFolio Shariah Checker")
+
+
+brand_header()
 
 tab_check, tab_ideas, tab_mine, tab_how = st.tabs(["Check", "Find stocks", "My holdings", "How it works"])
 

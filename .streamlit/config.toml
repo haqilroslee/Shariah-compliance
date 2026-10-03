@@ -1,0 +1,10 @@
+# WattleFolio theme (colours from the WattleFolio design tokens)
+[theme]
+base = "light"
+primaryColor = "#35645a"
+backgroundColor = "#f7f4ea"
+secondaryBackgroundColor = "#f0f7f5"
+textColor = "#2d4039"
+font = "sans serif"
+borderColor = "#dfe8e1"
+baseRadius = "0.5rem"
