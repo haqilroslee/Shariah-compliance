@@ -73,6 +73,7 @@ html, body, [class*="css"] { font-size: 18px; }
 .bar .fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 6px; }
 .bar .tick { position: absolute; top: -4px; bottom: -4px; width: 2px; background: rgba(128,128,128,0.8); }
 .row { display: flex; justify-content: space-between; font-size: 1rem; }
+.src { font-size: 0.85rem; opacity: 0.8; margin: -0.6rem 0 1rem; line-height: 1.5; }
 .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 0.75rem; margin: 0.5rem 0 1rem; }
 .card { border: 1px solid rgba(128,128,128,0.3); border-radius: 12px; padding: 0.8rem 1rem; }
 .card .head { display: flex; justify-content: space-between; align-items: center; gap: 0.5rem; font-weight: 700; }
@@ -116,15 +117,43 @@ def fx_rate(src, dst):
     return float(hist["Close"].dropna().iloc[-1])
 
 
-def latest(df, *labels):
-    if df is None or df.empty:
+def newest_first(df):
+    return None if df is None or df.empty else df[sorted(df.columns, reverse=True)]
+
+
+class Statement:
+    """One financial statement, read newest period first, remembering which periods the figures came from."""
+    def __init__(self, df):
+        self.df = newest_first(df)
+        self.date = self.df.columns[0] if self.df is not None else None
+        self.used = set()
+
+    def get(self, *labels):
+        if self.df is None:
+            return None
+        for label in labels:
+            if label in self.df.index:
+                row = self.df.loc[label].dropna()
+                if not row.empty:
+                    self.used.add(row.index[0])
+                    return float(row.iloc[0])
         return None
-    for label in labels:
-        if label in df.index:
-            row = df.loc[label].dropna()
-            if not row.empty:
-                return float(row.iloc[0])
-    return None
+
+    def older(self):
+        """Earliest older period a figure had to be taken from, if the newest report was missing some."""
+        old = [x for x in self.used if x < self.date]
+        return min(old) if old else None
+
+
+@st.cache_data(ttl=15 * 60, show_spinner=False)
+def quote(symbol):
+    """Latest price (in the quote's own units) and its date. Refreshed every 15 minutes."""
+    closes = yf.Ticker(symbol).history(period="5d", interval="1d", auto_adjust=False)["Close"].dropna()
+    return float(closes.iloc[-1]), closes.index[-1].strftime("%d %b %Y")
+
+
+def days_old(ts):
+    return (pd.Timestamp.now() - pd.Timestamp(ts).tz_localize(None)).days
 
 
 def dividends_12m(t, divisor):
@@ -164,7 +193,9 @@ def fetch_fund(t, info, symbol):
         "name": info.get("longName") or info.get("shortName") or symbol,
         "exchange": info.get("exchange", ""),
         "price": float(closes.iloc[-1]) / divisor,
+        "price_date": f"{closes.index[-1]:%d %b %Y}",
         "price_ccy": quote_ccy,
+        "divisor": divisor,
         "holdings": holdings,
         "bonds": assets.get("bondPosition") or 0.0,
         "sectors": {k: v for k, v in sectors.items() if v},
@@ -178,26 +209,27 @@ def fetch(symbol):
     info = t.info or {}
     if info.get("quoteType") in ("ETF", "MUTUALFUND"):
         return fetch_fund(t, info, symbol)
-    bs = t.quarterly_balance_sheet
-    if bs is None or bs.empty:
-        bs = t.balance_sheet
-    if bs is None or bs.empty:
+    # Use whichever balance sheet is newer: the annual report or the latest interim (half-year/quarterly) one
+    annual, interim = Statement(t.balance_sheet), Statement(t.quarterly_balance_sheet)
+    choices = [(st_.date, kind, st_) for kind, st_ in (("annual", annual), ("interim", interim)) if st_.date is not None]
+    if not choices:
         raise ValueError("no company figures found")
-    inc = t.income_stmt
+    _, bs_kind, bs = max(choices, key=lambda c: c[0])   # a tie keeps the annual report
+    inc = Statement(t.income_stmt)
 
-    debt = latest(bs, "Total Debt")
+    debt = bs.get("Total Debt")
     if debt is not None:
         # "Total Debt" includes leases
         if not INCLUDE_LEASES:
-            debt -= latest(bs, "Capital Lease Obligations") or 0
+            debt -= bs.get("Capital Lease Obligations") or 0
     else:
         # "Current Debt" and "Long Term Debt" exclude leases
-        debt = (latest(bs, "Current Debt") or 0) + (latest(bs, "Long Term Debt") or 0)
+        debt = (bs.get("Current Debt") or 0) + (bs.get("Long Term Debt") or 0)
         if INCLUDE_LEASES:
-            debt += latest(bs, "Capital Lease Obligations") or 0
-    cash = latest(bs, "Cash Cash Equivalents And Short Term Investments")
+            debt += bs.get("Capital Lease Obligations") or 0
+    cash = bs.get("Cash Cash Equivalents And Short Term Investments")
     if cash is None:
-        cash = (latest(bs, "Cash And Cash Equivalents") or 0) + (latest(bs, "Other Short Term Investments") or 0)
+        cash = (bs.get("Cash And Cash Equivalents") or 0) + (bs.get("Other Short Term Investments") or 0)
 
     quote_ccy = info.get("currency")
     fin_ccy = info.get("financialCurrency") or quote_ccy
@@ -213,7 +245,7 @@ def fetch(symbol):
         except Exception:
             shares = None
     if not shares:
-        shares = latest(bs, "Ordinary Shares Number", "Share Issued")
+        shares = bs.get("Ordinary Shares Number", "Share Issued")
     closes = t.history(period="3y", interval="1mo", auto_adjust=False)["Close"].dropna()
     if not shares or closes.empty:
         raise ValueError("no share price data found")
@@ -227,20 +259,30 @@ def fetch(symbol):
         "sector": info.get("sector") or "",
         "summary": info.get("longBusinessSummary") or "",
         "price": float(closes.iloc[-1]) / divisor,
+        "price_date": f"end of {closes.index[-1]:%b %Y}",
         "price_ccy": quote_ccy,
         "fin_ccy": fin_ccy,
-        "revenue": latest(inc, "Total Revenue", "Operating Revenue"),
-        "interest_income": latest(inc, "Interest Income", "Interest Income Non Operating"),
+        "divisor": divisor, "conv": conv, "shares": float(shares),
+        "revenue": inc.get("Total Revenue", "Operating Revenue"),
+        "interest_income": inc.get("Interest Income", "Interest Income Non Operating"),
         "debt": debt,
         "cash": cash,
-        "receivables": latest(bs, "Accounts Receivable", "Receivables") or 0.0,
-        "assets": latest(bs, "Total Assets"),
+        "receivables": bs.get("Accounts Receivable", "Receivables") or 0.0,
+        "assets": bs.get("Total Assets"),
         "avg_mcap": float(closes.iloc[-24:].mean()) * shares * conv,
         "avg_mcap_36": float(closes.iloc[-36:].mean()) * shares * conv,
         "dps_12m": dividends_12m(t, divisor),
         "mcap": float(closes.iloc[-1]) * shares * conv,
-        "as_of": bs.columns[0].strftime("%d %b %Y"),
-        "as_of_days": (pd.Timestamp.now() - pd.Timestamp(bs.columns[0]).tz_localize(None)).days,
+        "as_of": bs.date.strftime("%d %b %Y"),
+        "bs_kind": bs_kind,
+        "bs_label": (f"{bs.date:%d %b %Y} (FY{bs.date.year} annual report)" if bs_kind == "annual"
+                     else f"{bs.date:%d %b %Y} (latest half-year or quarterly report)"),
+        "bs_older": bs.older().strftime("%d %b %Y") if bs.older() is not None else None,
+        "inc_label": (f"FY{inc.date.year} annual report (year to {inc.date:%d %b %Y})" if inc.date is not None
+                      else "not available"),
+        "inc_older": inc.older().strftime("%d %b %Y") if inc.older() is not None else None,
+        "bs_days": days_old(bs.date),
+        "inc_days": days_old(inc.date) if inc.date is not None else 0,
     }
 
 
@@ -535,6 +577,7 @@ def fund_detail(d, s):
         st.write(f"Bonds: {d['bonds']:.0%} of the fund")
         st.caption("Only the biggest holdings that Yahoo Finance publishes can be checked. "
                    "For the full list, see the fund's own website.")
+        source_detail(d)
 
 
 def rules_cards():
@@ -562,6 +605,43 @@ def rules_cards():
     ])
 
 
+def source_links(symbol):
+    links = [f"[Yahoo Finance](https://finance.yahoo.com/quote/{symbol}/financials)"]
+    if symbol.upper().endswith(".AX"):
+        code = symbol.split(".")[0].lower()
+        links.append(f"[ASX announcements, incl. annual reports]"
+                     f"(https://www.asx.com.au/markets/trade-our-cash-market/announcements.{code})")
+    return " · ".join(links)
+
+
+def source_line(d):
+    """One short line under the verdict: when the price and figures are from."""
+    if d["kind"] == "fund":
+        parts = [f"Price {d['price_date']}", "holdings as listed on Yahoo Finance"]
+    else:
+        parts = [f"Price {d['price_date']}", f"balance sheet {d['as_of']}",
+                 d["inc_label"].split(" (")[0].replace(" annual report", " revenue")]
+    st.markdown(f'<div class="src">Source: Yahoo Finance · {" · ".join(html.escape(p) for p in parts)}</div>',
+                unsafe_allow_html=True)
+
+
+def source_detail(d):
+    """Full list of where each figure comes from, for the "More detail" section."""
+    lines = [f"- **Share price:** {d['price_ccy']} {d['price']:,.3f} on {d['price_date']} "
+             f"(refreshed every 15 minutes, may be delayed about 20 minutes by the exchange)"]
+    if d["kind"] == "stock":
+        lines += [f"- **Debt, cash, money owed, total assets:** balance sheet at {d['bs_label']}",
+                  f"- **Revenue and interest income:** {d['inc_label']}",
+                  f"- **Market value:** month-end share prices for the last 2 and 3 years × "
+                  f"{d['shares']:,.0f} shares on issue now; current value uses today's price"]
+        if d.get("bs_older"):
+            lines.append(f"- Some balance sheet figures were missing from that report, so ones from {d['bs_older']} were used")
+        if d.get("inc_older"):
+            lines.append(f"- Some income figures were missing from that report, so ones from {d['inc_older']} were used")
+    lines.append(f"- **Source:** {source_links(d['symbol'])}. Company figures are refreshed every 6 hours.")
+    st.markdown("**Where these figures come from**\n\n" + "\n".join(lines))
+
+
 def money(x, ccy=""):
     if x is None or (isinstance(x, float) and math.isnan(x)):
         return "–"
@@ -573,9 +653,17 @@ def money(x, ccy=""):
 
 def get_data(symbol):
     try:
-        return fetch(symbol), None
+        d = dict(fetch(symbol))
     except Exception as e:
         return None, f"Couldn't get figures for {symbol} right now ({e}). Check the code, or try again in a few minutes."
+    try:
+        raw, when = quote(symbol)
+        d["price"], d["price_date"] = raw / d["divisor"], when
+        if d["kind"] == "stock":
+            d["mcap"] = raw * d["shares"] * d["conv"]
+    except Exception:
+        pass   # keep the price from the main fetch
+    return d, None
 
 
 # ----------------------------------------------------------------------------- portfolio storage (in the link)
@@ -640,14 +728,19 @@ with tab_check:
                 with st.spinner("Checking what the fund holds…"):
                     s = screen_fund(d)
                 verdict_card(d, s)
+                source_line(d)
                 fund_detail(d, s)
             else:
                 s = screen(d)
                 verdict_card(d, s)
+                source_line(d)
 
-                if d.get("as_of_days", 0) > STALE_DAYS:
-                    st.warning(f"These company figures are from {d['as_of']}, over a year old. Yahoo Finance may be "
-                               f"missing the latest reports, so check the company's latest annual report too.")
+                old = ([f"balance sheet at {d['as_of']}"] if d["bs_days"] > STALE_DAYS else []) + \
+                      ([f"revenue from the {d['inc_label']}"] if d["inc_days"] > STALE_DAYS else [])
+                if old:
+                    st.warning(f"Some figures are over a year old ({' and '.join(old)}). Yahoo Finance may be missing "
+                               f"the latest reports, so check the company's latest annual report too: "
+                               f"{source_links(d['symbol'])}.")
 
                 st.subheader("Why")
                 if s["business"] == "Fail":
@@ -668,12 +761,13 @@ with tab_check:
                 with st.expander("More detail"):
                     by = f" ({s['checked_by']})" if s["business"] != "Review" else ""
                     st.write(f"Business check: **{s['business']}{by}**. {s['why'] if s['business'] != 'Fail' else ''}")
-                    st.write(f"Industry: {d['industry'] or 'unknown'} · Figures as of {d['as_of']} · Reported in {d['fin_ccy']}")
+                    st.write(f"Industry: {d['industry'] or 'unknown'} · Reported in {d['fin_ccy']}")
                     st.write(f"Debt {money(d['debt'])} · Cash & investments {money(d['cash'])} · "
                              f"Money owed {money(d['receivables'])} · 2-year average value {money(d['avg_mcap'])} · "
                              f"Total assets {money(d['assets'])}")
                     st.markdown("**How other standards see it**")
                     standards_table(s)
+                    source_detail(d)
 
 with tab_mine:
     st.write("Your holdings are saved in this page's link. After making changes, bookmark the page "
@@ -735,7 +829,7 @@ with tab_mine:
             <div class="verdict" style="background:{bg};color:{fg};padding:0.9rem 1.1rem;margin:0.5rem 0">
               <div style="font-size:1.25rem;font-weight:700">{html.escape(r['d']['name'])}: {label}</div>
               <div style="font-size:1rem">{action}{flag}</div>
-              <div class="who" style="margin-top:0.4rem">Value {money(r['value'], r['d']['price_ccy'])}</div>
+              <div class="who" style="margin-top:0.4rem">Value {money(r['value'], r['d']['price_ccy'])} · price {r['d']['price_date']}</div>
             </div>""", unsafe_allow_html=True)
 
         st.subheader("Before Ramadan")
@@ -797,6 +891,12 @@ with the family-rule check of their holdings alongside. Dividend cleaning uses t
 The app counts all of a company's cash, because Yahoo Finance doesn't separate interest-earning cash.
 The standards only count interest-earning cash, so cash-rich companies can look worse here than they really are.
 
-Figures come from Yahoo Finance and can be delayed or incomplete. This app is a calculator,
+**Where the figures come from.** Everything comes from Yahoo Finance. Share prices refresh every
+15 minutes (the exchange may delay them about 20 minutes). Company figures refresh every 6 hours and use the
+newest report Yahoo has: the latest half-year or quarterly balance sheet if it's newer than the annual
+report, and revenue from the latest annual report. Each stock shows the dates under its result, and
+"More detail" lists exactly which report each figure comes from, with links to check them.
+
+Figures can be delayed or incomplete. This app is a calculator,
 not a fatwa or financial advice. Check with a scholar you trust.
 """)
