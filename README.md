@@ -37,6 +37,13 @@ Edit them on GitHub and commit. Update `NEXT_REVIEW` each year after Ramadan.
 `INCLUDE_LEASES = True` counts lease liabilities as debt (stricter). Set it to `False` to exclude them.
 This matters for retailers: Woolworths' debt ratio is about 41% with leases and about 13% without.
 
+The comparison with AAOIFI, Dow Jones Islamic, S&P Shariah and MSCI (under **More detail** on each stock)
+is for information only and doesn't change the tier. Dow Jones Islamic reportedly dropped its cash and
+receivables tests in September 2023. Once you've confirmed that in the S&P methodology, set
+`DJIM_TEST_CASH_RECEIVABLES = False`.
+
+Dividends left blank in **My holdings** are filled in from Yahoo Finance (last 12 months).
+
 ## If it stops showing figures
 Yahoo Finance sometimes blocks requests from cloud servers. If every stock fails for more than a day,
 the fix is switching to a paid data source, which is a small code change.

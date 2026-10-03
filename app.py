@@ -3,6 +3,7 @@ Shariah Stock Checker: a simple web app for family and friends.
 Screening rules follow the family methodology (tiers at 30% / 33%, 5% revenue limit,
 24-month average market cap, 60-day exit window, purging, 2.5% zakat).
 """
+import html
 import math
 from datetime import date, datetime
 
@@ -16,8 +17,13 @@ TIER2_MAX = 0.33          # Tier 2: 30.1% - 33%; above = Tier 3
 REVENUE_LIMIT = 0.05      # non-permissible revenue must be below 5%
 EXIT_DAYS = 60            # orderly liquidation window for Tier 3
 ZAKAT_RATE = 0.025        # 2.5% of Tier 1 & 2 market value
-AAOIFI_LIMIT = 0.30       # comparison only (current market cap)
-MSCI_LIMIT = 0.3333       # comparison only (total assets)
+# Other standards, shown for comparison only (they don't change the tier)
+AAOIFI_LIMIT = 0.30       # debt and cash, each vs current market cap
+DJIM_LIMIT = 0.33         # Dow Jones Islamic: vs 24-month average market cap
+DJIM_TEST_CASH_RECEIVABLES = True   # DJIM reportedly dropped these two tests in Sept 2023; set False once confirmed
+SP_LIMIT = 0.33           # S&P Shariah: debt and cash vs 36-month average market cap
+SP_RECEIVABLES_LIMIT = 0.49   # S&P Shariah: receivables + cash vs 36-month average market cap
+MSCI_LIMIT = 0.3333       # MSCI Islamic: debt, cash, receivables + cash, each vs total assets
 INCLUDE_LEASES = True     # count lease liabilities as interest-bearing debt
 NEXT_REVIEW = date(2027, 2, 7)   # last day of Sha'ban 1448 (approx, confirm by moon sighting)
 REVIEWER = "Haqil"        # who checks business activities
@@ -98,10 +104,15 @@ def fetch(symbol):
     inc = t.income_stmt
 
     debt = latest(bs, "Total Debt")
-    if debt is None:
+    if debt is not None:
+        # "Total Debt" includes leases
+        if not INCLUDE_LEASES:
+            debt -= latest(bs, "Capital Lease Obligations") or 0
+    else:
+        # "Current Debt" and "Long Term Debt" exclude leases
         debt = (latest(bs, "Current Debt") or 0) + (latest(bs, "Long Term Debt") or 0)
-    if not INCLUDE_LEASES:
-        debt -= latest(bs, "Capital Lease Obligations") or 0
+        if INCLUDE_LEASES:
+            debt += latest(bs, "Capital Lease Obligations") or 0
     cash = latest(bs, "Cash Cash Equivalents And Short Term Investments")
     if cash is None:
         cash = (latest(bs, "Cash And Cash Equivalents") or 0) + (latest(bs, "Other Short Term Investments") or 0)
@@ -121,9 +132,20 @@ def fetch(symbol):
             shares = None
     if not shares:
         shares = latest(bs, "Ordinary Shares Number", "Share Issued")
-    closes = t.history(period="2y", interval="1mo", auto_adjust=False)["Close"].dropna()
+    closes = t.history(period="3y", interval="1mo", auto_adjust=False)["Close"].dropna()
     if not shares or closes.empty:
         raise ValueError("no share price data found")
+
+    # Dividends paid per share over the last 12 months (Yahoo, quote currency)
+    try:
+        divs = t.dividends
+        if divs is not None and not divs.empty:
+            cutoff = pd.Timestamp.now(tz=divs.index.tz) - pd.Timedelta(days=365)
+            dps_12m = float(divs[divs.index >= cutoff].sum()) / divisor
+        else:
+            dps_12m = 0.0
+    except Exception:
+        dps_12m = None
 
     return {
         "symbol": symbol,
@@ -140,7 +162,9 @@ def fetch(symbol):
         "cash": cash,
         "receivables": latest(bs, "Accounts Receivable", "Receivables") or 0.0,
         "assets": latest(bs, "Total Assets"),
-        "avg_mcap": float(closes.mean()) * shares * conv,
+        "avg_mcap": float(closes.iloc[-24:].mean()) * shares * conv,
+        "avg_mcap_36": float(closes.iloc[-36:].mean()) * shares * conv,
+        "dps_12m": dps_12m,
         "mcap": float(closes.iloc[-1]) * shares * conv,
         "as_of": bs.columns[0].strftime("%d %b %Y"),
     }
@@ -161,16 +185,60 @@ def ratio(a, b):
     return a / b if a is not None and b else None
 
 
+def review_pct(review):
+    """Family-entered non-permissible revenue %, tolerating '1.2%' or '1,2'. None if blank or unreadable."""
+    raw = review["non_permissible_revenue_pct"].strip().rstrip("%").strip().replace(",", ".")
+    try:
+        return float(raw) / 100 if raw else None
+    except ValueError:
+        return None
+
+
+def standards(d, failed_business):
+    """Other standards' ratio tests: {name: (basis, [(test, value, limit)], result)}."""
+    cash_recv = d["cash"] + d["receivables"] if d["cash"] is not None else None
+    djim_tests = [("Debt", ratio(d["debt"], d["avg_mcap"]), DJIM_LIMIT)]
+    if DJIM_TEST_CASH_RECEIVABLES:
+        djim_tests += [("Cash", ratio(d["cash"], d["avg_mcap"]), DJIM_LIMIT),
+                       ("Receivables", ratio(d["receivables"], d["avg_mcap"]), DJIM_LIMIT)]
+    out = {
+        "AAOIFI": ("current market value", [
+            ("Debt", ratio(d["debt"], d["mcap"]), AAOIFI_LIMIT),
+            ("Cash", ratio(d["cash"], d["mcap"]), AAOIFI_LIMIT)]),
+        "Dow Jones Islamic": ("2-year average market value", djim_tests),
+        "S&P Shariah": ("3-year average market value", [
+            ("Debt", ratio(d["debt"], d["avg_mcap_36"]), SP_LIMIT),
+            ("Cash", ratio(d["cash"], d["avg_mcap_36"]), SP_LIMIT),
+            ("Receivables + cash", ratio(cash_recv, d["avg_mcap_36"]), SP_RECEIVABLES_LIMIT)]),
+        "MSCI Islamic": ("total assets", [
+            ("Debt", ratio(d["debt"], d["assets"]), MSCI_LIMIT),
+            ("Cash", ratio(d["cash"], d["assets"]), MSCI_LIMIT),
+            ("Receivables + cash", ratio(cash_recv, d["assets"]), MSCI_LIMIT)]),
+    }
+    results = {}
+    for name, (basis, tests) in out.items():
+        if failed_business:
+            result = "Fail"
+        elif any(v is None for _, v, _ in tests):
+            result = "n/a"
+        else:
+            result = "Pass" if all(v <= limit for _, v, limit in tests) else "Fail"
+        results[name] = (basis, tests, result)
+    return results
+
+
 def screen(d):
     review = load_review().get(d["symbol"].upper())
     industry = f'{d["industry"]} {d["sector"]}'.lower()
 
     # Non-permissible revenue: family figure if entered, otherwise interest income as an estimate
     np_pct, np_source = None, ""
-    if review is not None and review["non_permissible_revenue_pct"].strip():
-        np_pct, np_source = float(review["non_permissible_revenue_pct"]) / 100, "family review"
+    if review is not None and review_pct(review) is not None:
+        np_pct, np_source = review_pct(review), "family review"
     elif d["revenue"]:
         np_pct, np_source = min(abs(d["interest_income"] or 0) / d["revenue"], 1.0), "estimate (interest income only)"
+        if review is not None and review["non_permissible_revenue_pct"].strip():
+            np_source += "; the family figure in sector_review.csv couldn't be read"
 
     if review is not None and review["excluded"].strip().lower() == "yes":
         business, why = "Fail", "The family review marked this business as excluded."
@@ -202,16 +270,10 @@ def screen(d):
     else:
         tier = "Tier 1"
 
-    def passes(base, limit, items):
-        if not base or business == "Fail":
-            return "Fail" if business == "Fail" else "n/a"
-        return "Pass" if all((x or 0) / base <= limit for x in items) else "Fail"
-
     return {
         "tier": tier, "business": business, "why": why, "ratios": r, "highest": highest,
         "purge_pct": np_pct or 0.0, "purge_source": np_source,
-        "aaoifi": passes(d["mcap"], AAOIFI_LIMIT, [d["debt"], d["cash"]]),
-        "msci": passes(d["assets"], MSCI_LIMIT, [d["debt"], d["cash"], d["receivables"]]),
+        "standards": standards(d, business == "Fail"),
     }
 
 
@@ -223,10 +285,10 @@ def verdict_card(d, s):
     <div class="verdict" style="background:{bg};color:{fg}">
       <div class="label">{label}</div>
       <div class="action">{action}</div>
-      <div class="who">{d['name']} ({d['symbol']}){tier_txt}</div>
+      <div class="who">{html.escape(d['name'])} ({html.escape(d['symbol'])}){tier_txt}</div>
     </div>""", unsafe_allow_html=True)
     if s["business"] == "Review":
-        st.markdown(f'<div class="note">{s["why"]}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="note">{html.escape(s["why"])}</div>', unsafe_allow_html=True)
 
 
 def ratio_bar(name, value):
@@ -240,6 +302,20 @@ def ratio_bar(name, value):
     <div class="bar"><div class="fill" style="width:{width:.1f}%;background:{colour}"></div>
       <div class="tick" style="left:{TIER1_MAX/0.5*100:.1f}%"></div>
       <div class="tick" style="left:{TIER2_MAX/0.5*100:.1f}%"></div></div>""", unsafe_allow_html=True)
+
+
+def standards_table(s):
+    def pct(v):
+        return "–" if v is None else f"{v:.1%}"
+    lines = ["| Standard | Compared with | Figures (limit) | Result |", "|---|---|---|---|"]
+    for name, (basis, tests, result) in s["standards"].items():
+        figs = "<br>".join(f"{t} {pct(v)} (max {limit * 100:g}%)" for t, v, limit in tests)
+        lines.append(f"| {name} | {basis} | {figs} | **{result}** |")
+    st.markdown("\n".join(lines), unsafe_allow_html=True)
+    st.caption("For comparison only: the colour above follows the family rules. "
+               "Every standard also needs under 5% non-permissible revenue. "
+               "\"Cash\" here is all of the company's cash; the standards only count interest-earning cash, "
+               "so cash-rich companies can look worse than they really are.")
 
 
 def money(x, ccy=""):
@@ -336,9 +412,11 @@ with tab_check:
                 with st.expander("More detail"):
                     st.write(f"Business check: **{s['business']}**. {s['why'] if s['business'] != 'Fail' else ''}")
                     st.write(f"Industry: {d['industry'] or 'unknown'} · Figures as of {d['as_of']} · Reported in {d['fin_ccy']}")
-                    st.write(f"Other standards: AAOIFI **{s['aaoifi']}** · MSCI **{s['msci']}**")
                     st.write(f"Debt {money(d['debt'])} · Cash & investments {money(d['cash'])} · "
-                             f"Money owed {money(d['receivables'])} · 2-year average value {money(d['avg_mcap'])}")
+                             f"Money owed {money(d['receivables'])} · 2-year average value {money(d['avg_mcap'])} · "
+                             f"Total assets {money(d['assets'])}")
+                    st.markdown("**How other standards see it**")
+                    standards_table(s)
 
 with tab_mine:
     st.write("Your holdings are saved in this page's link. After making changes, bookmark the page "
@@ -350,7 +428,8 @@ with tab_mine:
             column_config={
                 "Code": st.column_config.TextColumn("Code", help="Share code, e.g. BHP.AX"),
                 "Shares": st.column_config.NumberColumn("Shares", min_value=0, step=1),
-                "Dividend per share (last 12 months)": st.column_config.NumberColumn("Dividend per share (last 12 months)", min_value=0, format="%.4f"),
+                "Dividend per share (last 12 months)": st.column_config.NumberColumn("Dividend per share (last 12 months)", min_value=0, format="%.4f",
+                                                                                     help="Leave blank to use Yahoo Finance's figure"),
                 "Date it became not compliant": st.column_config.DateColumn("Date it became not compliant", help="Only for stocks that turned red"),
             })
         write_holdings(edited)
@@ -368,7 +447,9 @@ with tab_mine:
         shares = float(h["Shares"] or 0)
         value = shares * d["price"]
         dps = h["Dividend per share (last 12 months)"]
-        purge = shares * dps * s["purge_pct"] if pd.notna(dps) and dps else 0.0
+        if pd.isna(dps):
+            dps = d["dps_12m"]
+        purge = shares * dps * s["purge_pct"] if dps else 0.0
         zakat = value * ZAKAT_RATE if s["tier"] in ("Tier 1", "Tier 2") else 0.0
         days_left = None
         bd = h["Date it became not compliant"]
@@ -392,7 +473,7 @@ with tab_mine:
             flag = " · business not checked yet" if r["s"]["business"] == "Review" else ""
             st.markdown(f"""
             <div class="verdict" style="background:{bg};color:{fg};padding:0.9rem 1.1rem;margin:0.5rem 0">
-              <div style="font-size:1.25rem;font-weight:700">{r['d']['name']}: {label}</div>
+              <div style="font-size:1.25rem;font-weight:700">{html.escape(r['d']['name'])}: {label}</div>
               <div style="font-size:1rem">{action}{flag}</div>
               <div class="who" style="margin-top:0.4rem">Value {money(r['value'], r['d']['price_ccy'])}</div>
             </div>""", unsafe_allow_html=True)
@@ -430,6 +511,23 @@ its interest-bearing debt, its cash and interest-earning investments, and the mo
 
 **5. Yearly review** on the last day of Sha'ban: re-check holdings, give dividend cleaning amounts,
 and pay zakat of 2.5% on compliant and on-watch holdings.
+
+**How the family rules compare with the main standards.** Our rules are closest to Dow Jones Islamic
+(same 2-year average), but stricter: on-watch starts at 30%. Each stock's
+"More detail" section shows how every standard below would judge it.
+
+| | AAOIFI | Dow Jones Islamic | S&P Shariah | MSCI Islamic |
+|---|---|---|---|---|
+| Compared with | Current market value | 2-year average market value | 3-year average market value | Total assets |
+| Debt | under 30% | under 33% | under 33% | under 33.33% |
+| Cash & interest-earning investments | under 30% | under 33%\\* | under 33% | under 33.33% |
+| Money owed to the company | not tested | under 33%\\* | under 49% (with cash) | under 33.33% (with cash) |
+| Non-permissible revenue | under 5% | under 5% | under 5% | under 5% |
+
+\\* Dow Jones Islamic is reported to have dropped these two tests in September 2023 and now tests debt only.
+
+The app counts all of a company's cash, because Yahoo Finance doesn't separate interest-earning cash.
+The standards only count interest-earning cash, so cash-rich companies can look worse here than they really are.
 
 Figures come from Yahoo Finance and can be delayed or incomplete. This app is a calculator,
 not a fatwa or financial advice. Check with a scholar you trust.
