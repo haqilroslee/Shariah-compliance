@@ -61,6 +61,26 @@ html, body, [class*="css"] { font-size: 18px; }
 .bar .fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 6px; }
 .bar .tick { position: absolute; top: -4px; bottom: -4px; width: 2px; background: rgba(128,128,128,0.8); }
 .row { display: flex; justify-content: space-between; font-size: 1rem; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 0.75rem; margin: 0.5rem 0 1rem; }
+.card { border: 1px solid rgba(128,128,128,0.3); border-radius: 12px; padding: 0.8rem 1rem; }
+.card .head { display: flex; justify-content: space-between; align-items: center; gap: 0.5rem; font-weight: 700; }
+.card .sub { font-size: 0.85rem; opacity: 0.75; margin: 0.1rem 0 0.4rem; }
+.card .line { display: flex; justify-content: space-between; gap: 0.75rem; font-size: 0.95rem; padding: 0.15rem 0; }
+.card .line span:last-child { text-align: right; }
+.card .line.bad span:last-child { color: #E5484D; font-weight: 700; }
+.card small { opacity: 0.7; }
+.pill { display: inline-block; border-radius: 999px; padding: 0.1rem 0.6rem; font-size: 0.8rem; font-weight: 600; white-space: nowrap; }
+.holding { display: flex; justify-content: space-between; align-items: flex-start; gap: 0.75rem; padding: 0.55rem 0;
+           border-bottom: 1px solid rgba(128,128,128,0.2); }
+.holding .nm { font-weight: 600; overflow-wrap: anywhere; }
+.holding .meta { font-size: 0.85rem; margin-top: 0.2rem; display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; }
+.holding .wt { font-weight: 600; white-space: nowrap; }
+@media (max-width: 640px) {
+  html, body, [class*="css"] { font-size: 16px; }
+  .verdict { padding: 1.1rem 1.2rem; }
+  .verdict .label { font-size: 1.8rem; }
+  .verdict .action { font-size: 1.05rem; }
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -337,11 +357,11 @@ def screen_fund(f):
                 break
             d = None
         if d is None:
-            rows.append({"Holding": name, "Code": sym, "Weight": weight * 100, "Result": "Couldn't check"})
+            rows.append({"Holding": name, "Code": sym, "Weight": weight, "Result": "Couldn't check", "tier": "Incomplete"})
             continue
         hs = screen(d)
         result = TIER_STYLE[hs["tier"]][0] + (" (business not checked)" if hs["business"] == "Review" else "")
-        rows.append({"Holding": d["name"], "Code": d["symbol"], "Weight": weight * 100, "Result": result})
+        rows.append({"Holding": d["name"], "Code": d["symbol"], "Weight": weight, "Result": result, "tier": hs["tier"]})
         if hs["tier"] == "Incomplete":
             continue
         checked += weight
@@ -415,14 +435,28 @@ def ratio_bar(name, value):
       <div class="tick" style="left:{TIER2_MAX/0.5*100:.1f}%"></div></div>""", unsafe_allow_html=True)
 
 
+def pill(text, tier):
+    _, bg, fg, _ = TIER_STYLE[tier]
+    return f'<span class="pill" style="background:{bg};color:{fg}">{html.escape(text)}</span>'
+
+
+def cards(items):
+    """items: [(title, pill_html, subtitle, [(label, value_html, bad)])] -> grid of cards (1 column on phones)."""
+    out = []
+    for title, badge, sub, lines in items:
+        rows = "".join(f'<div class="line{" bad" if bad else ""}"><span>{label}</span><span>{value}</span></div>'
+                       for label, value, bad in lines)
+        out.append(f'<div class="card"><div class="head"><span>{title}</span>{badge}</div>'
+                   f'<div class="sub">{sub}</div>{rows}</div>')
+    st.markdown(f'<div class="cards">{"".join(out)}</div>', unsafe_allow_html=True)
+
+
 def standards_table(s):
     def pct(v):
         return "–" if v is None else f"{v:.1%}"
-    lines = ["| Standard | Compared with | Figures (limit) | Result |", "|---|---|---|---|"]
-    for name, (basis, tests, result) in s["standards"].items():
-        figs = "<br>".join(f"{t} {pct(v)} (max {limit * 100:g}%)" for t, v, limit in tests)
-        lines.append(f"| {name} | {basis} | {figs} | **{result}** |")
-    st.markdown("\n".join(lines), unsafe_allow_html=True)
+    cards([(name, pill(result, {"Pass": "Tier 1", "Fail": "Tier 3"}.get(result, "Incomplete")), f"vs {basis}",
+            [(t, f"{pct(v)} <small>/ max {limit * 100:g}%</small>", v is not None and v > limit) for t, v, limit in tests])
+           for name, (basis, tests, result) in s["standards"].items()])
     st.caption("For comparison only: the colour above follows the family rules. "
                "Every standard also needs under 5% non-permissible revenue. "
                "\"Cash\" here is all of the company's cash; the standards only count interest-earning cash, "
@@ -435,8 +469,10 @@ def fund_detail(d, s):
     if s["rows"]:
         st.subheader("What's inside")
         st.caption(f"The {len(s['rows'])} biggest holdings Yahoo Finance publishes, each checked with the family rules.")
-        st.dataframe(pd.DataFrame(s["rows"]), hide_index=True, width="stretch",
-                     column_config={"Weight": st.column_config.NumberColumn("Share of fund", format="%.1f%%")})
+        st.markdown("".join(
+            f'<div class="holding"><div><div class="nm">{html.escape(r["Holding"])}</div>'
+            f'<div class="meta"><span>{html.escape(r["Code"])}</span>{pill(r["Result"], r["tier"])}</div></div>'
+            f'<div class="wt">{r["Weight"]:.1%}</div></div>' for r in s["rows"]), unsafe_allow_html=True)
 
     st.subheader("Cleaning dividends")
     if s["checked"]:
@@ -453,6 +489,31 @@ def fund_detail(d, s):
         st.write(f"Bonds: {d['bonds']:.0%} of the fund")
         st.caption("Only the biggest holdings that Yahoo Finance publishes can be checked. "
                    "For the full list, see the fund's own website.")
+
+
+def rules_cards():
+    """The family rules next to each standard's limits, built from the settings at the top."""
+    def lim(x):
+        return f"under {x * 100:g}%"
+    family = f"{TIER1_MAX * 100:g}% <small>(watch to {TIER2_MAX * 100:g}%)</small>"
+    revenue = ("Non-permissible revenue", lim(REVENUE_LIMIT), False)
+    djim_extra = "*" if DJIM_TEST_CASH_RECEIVABLES else ""
+    cards([
+        ("Family rules", "", "vs 2-year average market value",
+         [("Debt", family, False), ("Cash", family, False), ("Money owed", family, False), revenue]),
+        ("AAOIFI", "", "vs current market value",
+         [("Debt", lim(AAOIFI_LIMIT), False), ("Cash", lim(AAOIFI_LIMIT), False), ("Money owed", "not tested", False), revenue]),
+        ("Dow Jones Islamic", "", "vs 2-year average market value",
+         [("Debt", lim(DJIM_LIMIT), False),
+          ("Cash", lim(DJIM_LIMIT) + djim_extra if DJIM_TEST_CASH_RECEIVABLES else "not tested", False),
+          ("Money owed", lim(DJIM_LIMIT) + djim_extra if DJIM_TEST_CASH_RECEIVABLES else "not tested", False), revenue]),
+        ("S&amp;P Shariah", "", "vs 3-year average market value",
+         [("Debt", lim(SP_LIMIT), False), ("Cash", lim(SP_LIMIT), False),
+          ("Money owed + cash", lim(SP_RECEIVABLES_LIMIT), False), revenue]),
+        ("MSCI Islamic", "", "vs total assets",
+         [("Debt", lim(MSCI_LIMIT), False), ("Cash", lim(MSCI_LIMIT), False),
+          ("Money owed + cash", lim(MSCI_LIMIT), False), revenue]),
+    ])
 
 
 def money(x, ccy=""):
@@ -568,11 +629,13 @@ with tab_mine:
         edited = st.data_editor(
             holdings, num_rows="dynamic", width="stretch", hide_index=True,
             column_config={
-                "Code": st.column_config.TextColumn("Code", help="Share or ETF code, e.g. BHP.AX"),
-                "Shares": st.column_config.NumberColumn("Shares", min_value=0, step=1),
-                "Dividend per share (last 12 months)": st.column_config.NumberColumn("Dividend per share (last 12 months)", min_value=0, format="%.4f",
-                                                                                     help="Leave blank to use Yahoo Finance's figure"),
-                "Date it became not compliant": st.column_config.DateColumn("Date it became not compliant", help="Only for stocks that turned red"),
+                "Code": st.column_config.TextColumn("Code", width=74, help="Share or ETF code, e.g. BHP.AX"),
+                "Shares": st.column_config.NumberColumn("Shares", width=70, min_value=0, step=1),
+                "Dividend per share (last 12 months)": st.column_config.NumberColumn(
+                    "Div.", width=60, min_value=0, format="%.4f",
+                    help="Dividend per share over the last 12 months. Leave blank to use Yahoo Finance's figure"),
+                "Date it became not compliant": st.column_config.DateColumn(
+                    "Red on", width=72, format="D/M/YY", help="Date it became not compliant. Only for stocks that turned red"),
             })
         write_holdings(edited)
 
@@ -665,14 +728,9 @@ with the family-rule check of their holdings alongside. Dividend cleaning uses t
 (same 2-year average), but stricter: on-watch starts at 30%. Each stock's
 "More detail" section shows how every standard below would judge it.
 
-| | AAOIFI | Dow Jones Islamic | S&P Shariah | MSCI Islamic |
-|---|---|---|---|---|
-| Compared with | Current market value | 2-year average market value | 3-year average market value | Total assets |
-| Debt | under 30% | under 33% | under 33% | under 33.33% |
-| Cash & interest-earning investments | under 30% | under 33%\\* | under 33% | under 33.33% |
-| Money owed to the company | not tested | under 33%\\* | under 49% (with cash) | under 33.33% (with cash) |
-| Non-permissible revenue | under 5% | under 5% | under 5% | under 5% |
-
+""")
+    rules_cards()
+    st.markdown(f"""
 \\* Dow Jones Islamic is reported to have dropped these two tests in September 2023 and now tests debt only.
 
 The app counts all of a company's cash, because Yahoo Finance doesn't separate interest-earning cash.
