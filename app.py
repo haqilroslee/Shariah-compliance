@@ -45,6 +45,8 @@ FUND_MAX_BONDS = 0.01     # conventional bonds pay interest; more than this fail
 ETF_FULL_TARGET = 0.95
 ETF_FULL_MAX = 150
 HOLDINGS_DIR = "etf_holdings"
+ETF_DEPTHS = {"quick": "Quick: top holdings from Yahoo",
+              "full": "Full: every holding from the fund provider (slower)"}
 SPDR_HOLDINGS_URL = "https://www.ssga.com/us/en/intermediary/etfs/library-content/products/fund-data/etfs/us/holdings-daily-us-en-{}.xlsx"
 BETASHARES_HOLDINGS_URL = "https://www.betashares.com.au/files/csv/{}_Portfolio_Holdings.csv"
 # "Find stocks" tab: the largest companies in a market are screened, then the best compliant ones listed
@@ -589,19 +591,28 @@ def provider_holdings(f):
         return None, ""
 
 
-def fund_holdings(f, allow_upload=True):
-    """Best holdings list available: (entries, where it came from, as-of date, is it the full list?)."""
+def full_check_on():
+    return st.session_state.get("etf_depth") == "full"
+
+
+def fund_holdings(f, allow_upload=True, want_full=None):
+    """Holdings list to check: (entries, where it came from, as-of date, is it the full list?).
+
+    Quick check: Yahoo's top holdings. Full check: the provider's full list where one can be found.
+    A file the visitor uploaded is always used."""
     up = st.session_state.get("uploaded_holdings", {}).get(f["symbol"].upper()) if allow_upload else None
     if up:
         return up["entries"], f"your uploaded file ({up['file']})", up["as_of"], True
+    yahoo = [{"ticker": t, "name": n, "weight": w, "country": "", "cash": False} for t, n, w in f["holdings"]]
+    if not (full_check_on() if want_full is None else want_full):
+        return yahoo, "Yahoo Finance (top holdings only)", "", False
     saved, fn = saved_holdings(f["symbol"])
     if saved:
         return saved["entries"], f"the saved holdings file ({fn})", saved["as_of"], True
     auto, who = provider_holdings(f)
     if auto:
         return auto["entries"], who, auto["as_of"], True
-    return ([{"ticker": t, "name": n, "weight": w, "country": "", "cash": False} for t, n, w in f["holdings"]],
-            "Yahoo Finance (top holdings only)", "", False)
+    return yahoo, "Yahoo Finance (top holdings only; no full list found for this fund)", "", False
 
 
 MIX_GROUPS = [("Compliant", "var(--wf-good)"), ("Needs review", "var(--wf-watch)"),
@@ -626,10 +637,11 @@ def check_holding(e, fund_symbol):
     return None, None
 
 
-def screen_fund(f, allow_upload=True):
+def screen_fund(f, allow_upload=True, want_full=None):
     """Look through an ETF's holdings (the full list where available) and screen each one with the WattleFolio rules."""
     islamic = any(w in f["name"].lower() for w in ISLAMIC_FUND_WORDS)
-    entries, source, as_of, full = fund_holdings(f, allow_upload)
+    wanted = full_check_on() if want_full is None else want_full
+    entries, source, as_of, full = fund_holdings(f, allow_upload, wanted)
     shares = sorted((e for e in entries if not e["cash"]), key=lambda e: -e["weight"])
     cash_w = sum(e["weight"] for e in entries if e["cash"])
     if full:   # largest first, until the target share of the fund is covered
@@ -698,7 +710,7 @@ def screen_fund(f, allow_upload=True):
                f"The other {1 - covered:.0%} can't be checked here.")
         action = ("Its holdings pass so far, but not enough of the fund could be checked. Ask a scholar or use a "
                   "certified Islamic ETF." if full else
-                  "Its top holdings pass, but most of the fund can't be checked here. Add its full holdings file, "
+                  "Its top holdings pass, but most of the fund can't be seen in a quick check. Try the full check, "
                   "ask a scholar or use a certified Islamic ETF.")
     else:
         tier = "Tier 2" if watch else "Tier 1"
@@ -711,6 +723,7 @@ def screen_fund(f, allow_upload=True):
         "purge_source": f"average of the holdings checked, {checked:.0%} of the fund" if checked else "",
         "rows": rows, "checked": checked, "islamic": islamic, "mix": holdings_mix(rows, extras),
         "source": source, "as_of": as_of, "full": full, "total_holdings": len(shares),
+        "full_missing": wanted and not full,
     }
 
 
@@ -771,7 +784,7 @@ def market_ideas(region, kind="stock"):
             return None
         y = d["dps_12m"] / d["price"] if d.get("dps_12m") and d["price"] else 0.0
         if kind == "etf":
-            s = screen_fund(d, allow_upload=False)
+            s = screen_fund(d, allow_upload=False, want_full=False)
             return {"d": d, "s": s, "market_cap": d.get("size") or u["market_cap"], "pe": None, "yield": y,
                     "ret_1y": d.get("ret_1y"), "fee": d.get("fee"), "debt": None, "highest": None}
         s = screen(d)
@@ -979,9 +992,13 @@ def fund_detail(d, s):
         if s["full"]:
             st.caption(f"Holdings from {s['source']}{dated}: {s['total_holdings']} shares in total. The largest "
                        f"{len(s['rows'])} were checked with the WattleFolio rules, covering {s['checked']:.0%} of the fund.")
+        elif s.get("full_missing"):
+            st.caption(f"No full holdings list could be found for this fund, so these are the {len(s['rows'])} biggest "
+                       f"holdings Yahoo Finance publishes. Add the fund's full holdings file below to check the rest.")
         else:
-            st.caption(f"The {len(s['rows'])} biggest holdings Yahoo Finance publishes, each checked with the WattleFolio "
-                       f"rules. Add the fund's full holdings file below to check the rest.")
+            n = len(s["rows"])
+            st.caption(f"Quick check: the {'biggest holding' if n == 1 else f'{n} biggest holdings'} Yahoo Finance "
+                       f"publishes, checked with the WattleFolio rules. Choose the full check above to look at every holding.")
 
         def holding_rows(rows):
             return "".join(
@@ -1174,6 +1191,9 @@ def brand_header():
 
 brand_header()
 
+if "etf_depth" not in st.session_state:   # quick or full ETF check, remembered in the link as ?etf=full
+    st.session_state["etf_depth"] = "full" if st.query_params.get("etf") == "full" else "quick"
+
 _ccy_options = ["Original currency"] + DISPLAY_CURRENCIES
 _ccy_saved = st.query_params.get("ccy", "")
 if "ccy_choice" not in st.session_state:   # first visit: start from the currency saved in the link
@@ -1208,7 +1228,21 @@ with tab_check:
             if err:
                 st.error(err)
             elif d["kind"] == "fund":
-                with st.spinner("Checking what the fund holds…"):
+                def _keep_depth():   # the setting outlives the control, which only exists on ETF pages
+                    st.session_state["etf_depth"] = st.session_state["etf_depth_choice"]
+                st.radio("How thoroughly to check this ETF", list(ETF_DEPTHS), format_func=ETF_DEPTHS.get,
+                         index=list(ETF_DEPTHS).index(st.session_state["etf_depth"]),
+                         key="etf_depth_choice", on_change=_keep_depth, horizontal=True,
+                         help="Quick uses the top holdings Yahoo Finance lists (usually 10). Full uses the fund "
+                              "provider's complete list where it can be found and checks up to "
+                              f"{ETF_FULL_MAX} holdings, which can take a minute the first time.")
+                if (st.query_params.get("etf") == "full") != full_check_on():
+                    if full_check_on():
+                        st.query_params["etf"] = "full"
+                    else:
+                        del st.query_params["etf"]
+                with st.spinner("Checking every holding… this can take a minute the first time." if full_check_on()
+                                else "Checking what the fund holds…"):
                     s = screen_fund(d)
                 verdict_card(d, s)
                 key_figures(d)
@@ -1451,8 +1485,12 @@ with the WattleFolio check of their holdings alongside. Dividend cleaning uses t
 Each ETF also shows how much of the fund (by weight) is compliant, needs review, is not compliant, couldn't be
 checked, or isn't listed by Yahoo.
 
-**Full ETF holdings.** Yahoo Finance only lists an ETF's top 10 holdings. When the fund provider's full holdings
-file is available (uploaded on the ETF's page, saved in the app and refreshed each night, or downloaded
+**Quick or full ETF check.** Each ETF page lets you choose. **Quick** (the default) checks the top 10 holdings
+Yahoo Finance lists: instant, and often enough to see whether a fund holds banks. **Full** checks the fund
+provider's complete list. The choice is remembered in the page link and also applies to My holdings.
+
+**Full ETF holdings.** Yahoo Finance only lists an ETF's top 10 holdings. With the full check, when the fund
+provider's full holdings file is available (uploaded on the ETF's page, saved in the app and refreshed each night, or downloaded
 automatically for SPDR and BetaShares ETFs), the app checks the largest holdings until 95% of the fund is covered, up to 150 holdings. Cash and futures
 are shown separately. An ETF checked this way can be compliant if everything checked passes.
 

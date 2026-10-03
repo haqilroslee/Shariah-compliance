@@ -70,7 +70,11 @@ Every result has buttons to Yahoo Finance, the company's annual reports (ASX, SE
 website and a Google search for its annual report, for checking the figures by hand.
 
 ## Full ETF holdings
-Yahoo Finance only lists an ETF's top 10 holdings. The app uses the provider's full holdings list instead when it
+Each ETF page has a **Quick / Full** choice. Quick (default) checks Yahoo Finance's top 10 holdings. Full uses the
+provider's complete list. The choice is saved in the link (`?etf=full`) and also applies to My holdings; Find stocks
+always uses Quick so the market list stays fast. An uploaded file is always used.
+
+Yahoo Finance only lists an ETF's top 10 holdings. With Full, the app uses the provider's full holdings list when it
 can: a file uploaded on the ETF's page (for that visit), a file saved in `etf_holdings/` (permanent; see the
 README in that folder for Vanguard, BetaShares and SPDR download steps), or, for US SPDR ETFs such as SPY, the
 daily file downloaded automatically from State Street (and BetaShares' file for BetaShares ETFs). A GitHub Action
