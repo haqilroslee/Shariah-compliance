@@ -6,11 +6,13 @@ Screening rules follow the family methodology (tiers at 30% / 33%, 5% revenue li
 import html
 import math
 import re
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 
 import pandas as pd
 import streamlit as st
 import yfinance as yf
+from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
 
 # ----------------------------------------------------------------------------- settings
 TIER1_MAX = 0.30          # Tier 1: highest ratio <= 30%
@@ -31,6 +33,11 @@ INCLUDE_LEASES = True     # count lease liabilities as interest-bearing debt
 ISLAMIC_FUND_WORDS = ["islamic", "shariah", "sharia", "syariah", "halal"]   # in a fund's name = has its own Shariah board
 FUND_FULL_COVERAGE = 0.99  # share of an ETF the published holdings must cover to give a full verdict
 FUND_MAX_BONDS = 0.01     # conventional bonds pay interest; more than this fails an ETF
+# "Find stocks" tab: the largest companies in a market are screened, then the best compliant ones listed
+IDEAS_MARKETS = {"Australia (ASX)": "au", "United States": "us", "Malaysia (Bursa)": "my"}
+IDEAS_CANDIDATES = 100    # how many of the largest companies to screen (more = slower first load)
+IDEAS_SHOW = 50
+IDEAS_SKIP_SECTORS = ["Financial Services"]   # mostly banks and insurers, so not worth screening
 NEXT_REVIEW = date(2027, 2, 7)   # last day of Sha'ban 1448 (approx, confirm by moon sighting)
 REVIEWER = "Haqil"        # who checks business activities
 
@@ -272,6 +279,7 @@ def fetch(symbol):
         "avg_mcap": float(closes.iloc[-24:].mean()) * shares * conv,
         "avg_mcap_36": float(closes.iloc[-36:].mean()) * shares * conv,
         "dps_12m": dividends_12m(t, divisor),
+        "ret_1y": float(closes.iloc[-1] / closes.iloc[-13] - 1) if len(closes) >= 13 else None,
         "mcap": float(closes.iloc[-1]) * shares * conv,
         "as_of": bs.date.strftime("%d %b %Y"),
         "bs_kind": bs_kind,
@@ -494,6 +502,51 @@ def evaluate(d):
     return screen_fund(d) if d["kind"] == "fund" else screen(d)
 
 
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def market_universe(region):
+    """The largest companies in a market from Yahoo's screener, leaving out the skipped sectors."""
+    sectors = [x for x in ("Basic Materials", "Communication Services", "Consumer Cyclical", "Consumer Defensive",
+                           "Energy", "Financial Services", "Healthcare", "Industrials", "Real Estate", "Technology",
+                           "Utilities") if x not in IDEAS_SKIP_SECTORS]
+    query = yf.EquityQuery("and", [yf.EquityQuery("eq", ["region", region]),
+                                   yf.EquityQuery("is-in", ["sector", *sectors])])
+    quotes = yf.screen(query, size=IDEAS_CANDIDATES, sortField="intradaymarketcap", sortAsc=False).get("quotes", [])
+    return [{"symbol": q["symbol"], "market_cap": q.get("marketCap"), "pe": q.get("trailingPE")}
+            for q in quotes if q.get("symbol")]
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def market_ideas(region):
+    """Screen every company in the market universe. Saved for a day, so only the first visit is slow."""
+    universe = market_universe(region)
+    ctx = get_script_run_ctx()
+
+    def check(u):
+        d, _ = get_data(u["symbol"])
+        if d is None or d["kind"] != "stock":
+            return None
+        s = screen(d)
+        return {"d": d, "s": s, "market_cap": u["market_cap"],
+                "pe": u["pe"] if u["pe"] and u["pe"] > 0 else None,
+                "yield": d["dps_12m"] / d["price"] if d.get("dps_12m") and d["price"] else 0.0,
+                "ret_1y": d.get("ret_1y"), "debt": s["ratios"]["Debt"], "highest": s["highest"]}
+
+    with ThreadPoolExecutor(max_workers=6, initializer=lambda: add_script_run_ctx(None, ctx)) as pool:
+        rows = [r for r in pool.map(check, universe) if r is not None]
+    return rows, len(universe), datetime.now().strftime("%d %b %Y %H:%M")
+
+
+# Sort options: label -> (row key, largest first?)
+IDEA_SORTS = {
+    "Biggest companies": ("market_cap", True),
+    "Highest dividend yield": ("yield", True),
+    "Best 1-year price change": ("ret_1y", True),
+    "Lowest P/E (cheapest vs profits)": ("pe", False),
+    "Lowest debt": ("debt", False),
+    "Most room under the Shariah limits": ("highest", False),
+}
+
+
 # ----------------------------------------------------------------------------- display helpers
 def verdict_card(d, s):
     label, bg, fg, action = TIER_STYLE[s["tier"]]
@@ -704,7 +757,7 @@ def write_holdings(df):
 # ----------------------------------------------------------------------------- pages
 st.title("Shariah Stock Checker")
 
-tab_check, tab_mine, tab_how = st.tabs(["Check a stock or ETF", "My holdings", "How it works"])
+tab_check, tab_ideas, tab_mine, tab_how = st.tabs(["Check", "Find stocks", "My holdings", "How it works"])
 
 with tab_check:
     query = st.text_input("Company, ETF or share code", placeholder="e.g. Woolworths, BHP.AX, Apple, SPUS")
@@ -768,6 +821,65 @@ with tab_check:
                     st.markdown("**How other standards see it**")
                     standards_table(s)
                     source_detail(d)
+
+with tab_ideas:
+    st.write(f"The largest companies in a market, screened with the family rules. The top {IDEAS_SHOW} that pass "
+             "are listed, sorted the way you choose.")
+    st.caption("These are ideas to research, not recommendations or financial advice. They're ranked on figures "
+               "only, so check each company yourself before buying.")
+    market = st.selectbox("Market", list(IDEAS_MARKETS))
+    c1, c2 = st.columns(2)
+    sort_by = c1.selectbox("Sort by", list(IDEA_SORTS))
+    include_watch = c2.checkbox("Include \"on watch\" stocks", value=False)
+    include_manual = c2.checkbox("Include stocks that need a manual business check", value=True)
+
+    if st.session_state.get("ideas_market") != market:
+        if st.button(f"Find stocks in {market}", type="primary"):
+            st.session_state["ideas_market"] = market
+            st.rerun()
+        st.caption(f"Checks the {IDEAS_CANDIDATES} largest companies. The first search of the day can take a few "
+                   "minutes; after that the results are saved for 24 hours.")
+    else:
+        region = IDEAS_MARKETS[market]
+        try:
+            with st.spinner(f"Checking the {IDEAS_CANDIDATES} largest companies in {market}… "
+                            "this can take a few minutes the first time each day."):
+                rows, screened, when = market_ideas(region)
+        except Exception as e:
+            rows, screened, when = None, 0, ""
+            st.error(f"Couldn't get the list of companies from Yahoo Finance right now ({e}). Try again later.")
+
+        if rows is not None:
+            allowed = {"Tier 1"} | ({"Tier 2"} if include_watch else set())
+            keep = [r for r in rows if r["s"]["tier"] in allowed
+                    and (r["s"]["business"] == "Pass" or (include_manual and r["s"]["business"] == "Review"))]
+            key, desc = IDEA_SORTS[sort_by]
+            have = [r for r in keep if r[key] is not None]
+            have.sort(key=lambda r: r[key], reverse=desc)
+            top = have[:IDEAS_SHOW]
+            st.caption(f"{len(keep)} of {screened} companies passed · screened {when} · source: Yahoo Finance"
+                       + (f" · {len(keep) - len(have)} left out because their {sort_by.lower()} figure is missing"
+                          if len(have) < len(keep) else ""))
+            if not top:
+                st.info("No companies passed with these settings. Try including \"on watch\" stocks or ones that "
+                        "need a manual check.")
+            for i, r in enumerate(top, 1):
+                d, s = r["d"], r["s"]
+                label = TIER_STYLE[s["tier"]][0] + (" · needs manual check" if s["business"] == "Review" else "")
+                figures = [f"Value {money(r['market_cap'], d['price_ccy'])}" if r["market_cap"] else None,
+                           f"Dividend yield {r['yield']:.1%}",
+                           f"1-year {r['ret_1y']:+.0%}" if r["ret_1y"] is not None else None,
+                           f"P/E {r['pe']:.1f}" if r["pe"] else None,
+                           f"Debt {r['debt']:.0%}" if r["debt"] is not None else None]
+                with st.expander(f"{i}. {d['name']} ({d['symbol']}) · {label}"):
+                    st.write(" · ".join(f for f in figures if f))
+                    st.write(f"Industry: {d['industry'] or 'unknown'}")
+                    if s["business"] == "Review":
+                        st.markdown(f'<div class="note">{html.escape(s["why"])}</div>', unsafe_allow_html=True)
+                    for name, v in s["ratios"].items():
+                        ratio_bar(name, v)
+                    source_line(d)
+                    st.caption("For the full check, search for this code in the \"Check\" tab.")
 
 with tab_mine:
     st.write("Your holdings are saved in this page's link. After making changes, bookmark the page "
@@ -878,6 +990,10 @@ with the rules above. An ETF is not compliant if any of them fails, or if more t
 If they all pass but don't make up the whole fund, it shows "Can't tell yet", because the rest can't be seen.
 Funds with Islamic, Shariah or Halal in their name have their own Shariah board, so they're shown as compliant,
 with the family-rule check of their holdings alongside. Dividend cleaning uses the average of the holdings checked.
+
+**7. Find stocks.** Lists the largest companies in a market that pass the family rules, sorted by the
+figure you choose. Banks and insurers are left out before screening. These are ideas to research, not
+recommendations. The list is worked out once a day, so the first search of the day takes a few minutes.
 
 **How the family rules compare with the main standards.** Our rules are closest to Dow Jones Islamic
 (same 2-year average), but stricter: on-watch starts at 30%. Each stock's

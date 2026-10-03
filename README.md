@@ -58,6 +58,13 @@ publishes (usually the biggest 10). A normal ETF fails if any of them fails or i
 "Can't tell yet" if they pass but don't cover the whole fund. Funds with Islamic, Shariah, Sharia, Syariah
 or Halal in their name are treated as screened by their own Shariah board (`ISLAMIC_FUND_WORDS` in `app.py`).
 
+## Find stocks
+The **Find stocks** tab takes the largest companies in a market (Australia, United States or Malaysia) from
+Yahoo Finance's screener, leaves out the Financial Services sector, screens the rest with the family rules and
+lists the top 50 that pass. You can sort by size, dividend yield, 1-year price change, P/E, debt or room under the
+Shariah limits. It only runs when someone taps the button, and results are saved for 24 hours. The number of
+companies screened is `IDEAS_CANDIDATES` at the top of `app.py`.
+
 ## If it stops showing figures
 Yahoo Finance sometimes blocks requests from cloud servers. If every stock fails for more than a day,
 the fix is switching to a paid data source, which is a small code change.
