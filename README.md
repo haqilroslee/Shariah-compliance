@@ -63,7 +63,11 @@ The **Find stocks** tab takes the largest companies in a market (Australia, Unit
 Yahoo Finance's screener, leaves out the Financial Services sector, screens the rest with the WattleFolio rules and
 lists the top 50 that pass. You can sort by size, dividend yield, 1-year price change, P/E, debt or room under the
 Shariah limits. It only runs when someone taps the button, and results are saved for 24 hours. The number of
-companies screened is `IDEAS_CANDIDATES` at the top of `app.py`.
+companies screened is `IDEAS_CANDIDATES` at the top of `app.py`. Tick **ETFs only** to screen the largest ETFs
+(`IDEAS_ETF_CANDIDATES`) plus Islamic ETFs found by name, sorted by size, dividend yield, 1-year change or fees.
+
+Every result has buttons to Yahoo Finance, the company's annual reports (ASX, SEC or Bursa Malaysia), its
+website and a Google search for its annual report, for checking the figures by hand.
 
 ## If it stops showing figures
 Yahoo Finance sometimes blocks requests from cloud servers. If every stock fails for more than a day,

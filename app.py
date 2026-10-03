@@ -7,6 +7,7 @@ import base64
 import html
 import math
 import re
+from urllib.parse import quote_plus
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 
@@ -39,6 +40,8 @@ IDEAS_MARKETS = {"Australia (ASX)": "au", "United States": "us", "Malaysia (Burs
 IDEAS_CANDIDATES = 100    # how many of the largest companies to screen (more = slower first load)
 IDEAS_SHOW = 50
 IDEAS_SKIP_SECTORS = ["Financial Services"]   # mostly banks and insurers, so not worth screening
+IDEAS_ETF_CANDIDATES = 60   # largest ETFs per market to look through (each one checks ~10 holdings)
+MARKET_SUFFIX = {"au": ".AX", "my": ".KL", "us": ""}   # Yahoo code endings, to keep name-search hits in the market
 NEXT_REVIEW = date(2027, 2, 7)   # last day of Sha'ban 1448 (approx, confirm by moon sighting)
 MANUAL_CHECK_TIP = ("Before buying, look at the company's latest annual report: check what it earns its revenue "
                     "from and whether any of it is non-permissible, or ask a scholar you trust.")
@@ -127,6 +130,11 @@ html, body, .stApp, .stApp p, .stApp li, .stApp input, .stApp button, .stApp lab
 .bar .tick { position: absolute; top: -4px; bottom: -4px; width: 2px; background: var(--wf-muted); }
 .row { display: flex; justify-content: space-between; font-size: 1rem; }
 .src { font-size: 0.85rem; opacity: 0.8; margin: -0.6rem 0 1rem; line-height: 1.5; }
+.links { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: -0.4rem 0 1.1rem; }
+.links a { display: inline-block; padding: 0.3rem 0.75rem; border: 1px solid var(--wf-line); border-radius: 999px;
+           background: var(--wf-surface); color: var(--wf-primary) !important; font-size: 0.85rem; font-weight: 600;
+           text-decoration: none !important; white-space: nowrap; }
+.links a:hover { border-color: var(--wf-primary); }
 .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 0.75rem; margin: 0.5rem 0 1rem; }
 .card { border: 1px solid var(--wf-line); border-radius: 8px; padding: 0.8rem 1rem; background: var(--wf-surface);
         box-shadow: 0 1px 2px rgba(0,0,0,0.04); }
@@ -230,10 +238,10 @@ def fetch_fund(t, info, symbol):
     divisor = 1
     if quote_ccy in MINOR_UNITS:
         quote_ccy, divisor = MINOR_UNITS[quote_ccy]
-    closes = t.history(period="1mo", auto_adjust=False)["Close"].dropna()
+    closes = t.history(period="2y", interval="1mo", auto_adjust=False)["Close"].dropna()
     if closes.empty:
         raise ValueError("no price data found")
-    holdings, assets, sectors = [], {}, {}
+    holdings, assets, sectors, fee, family = [], {}, {}, None, None
     try:
         fd = t.funds_data
         top = fd.top_holdings
@@ -241,15 +249,25 @@ def fetch_fund(t, info, symbol):
             holdings = [(str(sym), str(row["Name"]), float(row["Holding Percent"])) for sym, row in top.iterrows()]
         assets = fd.asset_classes or {}
         sectors = fd.sector_weightings or {}
+        family = (fd.fund_overview or {}).get("family")
+        ops = fd.fund_operations
+        if ops is not None and "Annual Report Expense Ratio" in ops.index:
+            raw = pd.to_numeric(ops.loc["Annual Report Expense Ratio"].iloc[0], errors="coerce")
+            fee = None if pd.isna(raw) else float(raw) / (100 if raw > 0.2 else 1)   # some funds report it as a %
     except Exception:
         pass
     return {
         "kind": "fund",
+        "website": info.get("website") or "",
+        "family": family or info.get("fundFamily") or "",
+        "fee": fee,
+        "size": info.get("totalAssets") or info.get("netAssets"),
+        "ret_1y": float(closes.iloc[-1] / closes.iloc[-13] - 1) if len(closes) >= 13 else None,
         "symbol": symbol,
         "name": info.get("longName") or info.get("shortName") or symbol,
         "exchange": info.get("exchange", ""),
         "price": float(closes.iloc[-1]) / divisor,
-        "price_date": f"{closes.index[-1]:%d %b %Y}",
+        "price_date": f"end of {closes.index[-1]:%b %Y}",
         "price_ccy": quote_ccy,
         "divisor": divisor,
         "holdings": holdings,
@@ -314,6 +332,7 @@ def fetch(symbol):
         "industry": info.get("industry") or "",
         "sector": info.get("sector") or "",
         "summary": info.get("longBusinessSummary") or "",
+        "website": info.get("website") or "",
         "price": float(closes.iloc[-1]) / divisor,
         "price_date": f"end of {closes.index[-1]:%b %Y}",
         "price_ccy": quote_ccy,
@@ -565,20 +584,52 @@ def market_universe(region):
 
 
 @st.cache_data(ttl=24 * 3600, show_spinner=False)
-def market_ideas(region):
-    """Screen every company in the market universe. Saved for a day, so only the first visit is slow."""
-    universe = market_universe(region)
+def etf_universe(region):
+    """The largest ETFs in a market, plus any Islamic/Shariah/Halal ETFs found by name (they're often small)."""
+    found = {}
+    try:
+        quotes = yf.screen(yf.ETFQuery("eq", ["region", region]), size=IDEAS_ETF_CANDIDATES,
+                           sortField="fundnetassets", sortAsc=False).get("quotes", [])
+        for q in quotes:
+            if q.get("symbol"):
+                found[q["symbol"]] = {"symbol": q["symbol"], "market_cap": q.get("netAssets") or q.get("totalAssets"), "pe": None}
+    except Exception:
+        pass
+    suffix = MARKET_SUFFIX.get(region)
+    for word in ISLAMIC_FUND_WORDS:
+        try:
+            hits = yf.Search(f"{word} etf", max_results=20).quotes
+        except Exception:
+            continue
+        for q in hits:
+            sym = q.get("symbol") or ""
+            in_market = sym.endswith(suffix) if suffix else "." not in sym
+            if q.get("quoteType") == "ETF" and in_market and sym not in found:
+                found[sym] = {"symbol": sym, "market_cap": None, "pe": None}
+    if not found:
+        raise ValueError("no ETFs found for this market")
+    return list(found.values())
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def market_ideas(region, kind="stock"):
+    """Screen every company (or ETF) in the market universe. Saved for a day, so only the first visit is slow."""
+    universe = etf_universe(region) if kind == "etf" else market_universe(region)
     ctx = get_script_run_ctx()
 
     def check(u):
         d, _ = get_data(u["symbol"])
-        if d is None or d["kind"] != "stock":
+        if d is None or d["kind"] != kind.replace("etf", "fund"):
             return None
+        y = d["dps_12m"] / d["price"] if d.get("dps_12m") and d["price"] else 0.0
+        if kind == "etf":
+            s = screen_fund(d)
+            return {"d": d, "s": s, "market_cap": d.get("size") or u["market_cap"], "pe": None, "yield": y,
+                    "ret_1y": d.get("ret_1y"), "fee": d.get("fee"), "debt": None, "highest": None}
         s = screen(d)
         return {"d": d, "s": s, "market_cap": u["market_cap"],
-                "pe": u["pe"] if u["pe"] and u["pe"] > 0 else None,
-                "yield": d["dps_12m"] / d["price"] if d.get("dps_12m") and d["price"] else 0.0,
-                "ret_1y": d.get("ret_1y"), "debt": s["ratios"]["Debt"], "highest": s["highest"]}
+                "pe": u["pe"] if u["pe"] and u["pe"] > 0 else None, "yield": y,
+                "ret_1y": d.get("ret_1y"), "fee": None, "debt": s["ratios"]["Debt"], "highest": s["highest"]}
 
     with ThreadPoolExecutor(max_workers=6, initializer=lambda: add_script_run_ctx(None, ctx)) as pool:
         rows = [r for r in pool.map(check, universe) if r is not None]
@@ -594,6 +645,42 @@ IDEA_SORTS = {
     "Lowest debt": ("debt", False),
     "Most room under the Shariah limits": ("highest", False),
 }
+ETF_SORTS = {
+    "Biggest funds": ("market_cap", True),
+    "Highest dividend yield": ("yield", True),
+    "Best 1-year price change": ("ret_1y", True),
+    "Lowest fees": ("fee", False),
+}
+
+
+def research_links(d):
+    """Where to check a company or fund yourself: (label, url) pairs."""
+    sym, stock = d["symbol"], d["kind"] == "stock"
+    code = sym.split(".")[0]
+    yahoo = f"https://finance.yahoo.com/quote/{sym}"
+    links = [("Yahoo Finance", f"{yahoo}/")]
+    links += [("Financials", f"{yahoo}/financials/"), ("Company profile", f"{yahoo}/profile/")] if stock \
+        else [("Holdings", f"{yahoo}/holdings/")]
+    if sym.upper().endswith(".AX"):
+        links.append(("Annual reports (ASX)" if stock else "ASX announcements",
+                      f"https://www.asx.com.au/markets/trade-our-cash-market/announcements.{code.lower()}"))
+    elif sym.upper().endswith(".KL"):
+        links.append(("Annual reports (Bursa)",
+                      f"https://www.bursamalaysia.com/market_information/announcements/company_announcement?company={code}"))
+    elif "." not in sym and stock:
+        links.append(("Annual reports (SEC 10-K)",
+                      f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={sym}&type=10-K&dateb=&owner=include&count=40"))
+    if d.get("website"):
+        links.append(("Company website" if stock else "Fund website", d["website"]))
+    what = "annual report" if stock else "ETF product disclosure statement"
+    links.append((f"Search: {what}", f"https://www.google.com/search?q={quote_plus(d['name'] + ' ' + what)}"))
+    return links
+
+
+def research_buttons(d):
+    st.markdown('<div class="links">' + "".join(
+        f'<a href="{html.escape(url, quote=True)}" target="_blank" rel="noopener">{html.escape(label)} ↗</a>'
+        for label, url in research_links(d)) + "</div>", unsafe_allow_html=True)
 
 
 # ----------------------------------------------------------------------------- display helpers
@@ -707,13 +794,8 @@ def rules_cards():
     ])
 
 
-def source_links(symbol):
-    links = [f"[Yahoo Finance](https://finance.yahoo.com/quote/{symbol}/financials)"]
-    if symbol.upper().endswith(".AX"):
-        code = symbol.split(".")[0].lower()
-        links.append(f"[ASX announcements, incl. annual reports]"
-                     f"(https://www.asx.com.au/markets/trade-our-cash-market/announcements.{code})")
-    return " · ".join(links)
+def source_links(d):
+    return " · ".join(f"[{label}]({url})" for label, url in research_links(d) if not label.startswith("Search"))
 
 
 def source_line(d):
@@ -740,7 +822,7 @@ def source_detail(d):
             lines.append(f"- Some balance sheet figures were missing from that report, so ones from {d['bs_older']} were used")
         if d.get("inc_older"):
             lines.append(f"- Some income figures were missing from that report, so ones from {d['inc_older']} were used")
-    lines.append(f"- **Source:** {source_links(d['symbol'])}. Company figures are refreshed every 6 hours.")
+    lines.append(f"- **Source:** {source_links(d)}. Company figures are refreshed every 6 hours.")
     st.markdown("**Where these figures come from**\n\n" + "\n".join(lines))
 
 
@@ -852,18 +934,20 @@ with tab_check:
                     s = screen_fund(d)
                 verdict_card(d, s)
                 source_line(d)
+                research_buttons(d)
                 fund_detail(d, s)
             else:
                 s = screen(d)
                 verdict_card(d, s)
                 source_line(d)
+                research_buttons(d)
 
                 old = ([f"balance sheet at {d['as_of']}"] if d["bs_days"] > STALE_DAYS else []) + \
                       ([f"revenue from the {d['inc_label']}"] if d["inc_days"] > STALE_DAYS else [])
                 if old:
                     st.warning(f"Some figures are over a year old ({' and '.join(old)}). Yahoo Finance may be missing "
                                f"the latest reports, so check the company's latest annual report too: "
-                               f"{source_links(d['symbol'])}.")
+                               f"{source_links(d)}.")
 
                 st.subheader("Why")
                 if s["business"] == "Fail":
@@ -893,62 +977,82 @@ with tab_check:
                     source_detail(d)
 
 with tab_ideas:
-    st.write(f"The largest companies in a market, screened with the WattleFolio rules. The top {IDEAS_SHOW} that pass "
+    etf_mode = st.checkbox("ETFs only", value=False, help="Look through the largest ETFs in the market instead of companies")
+    things = "ETFs" if etf_mode else "companies"
+    st.write(f"The largest {things} in a market, screened with the WattleFolio rules. The top {IDEAS_SHOW} that pass "
              "are listed, sorted the way you choose.")
-    st.caption("These are ideas to research, not recommendations or financial advice. They're ranked on figures "
-               "only, so check each company yourself before buying.")
+    st.caption(f"These are ideas to research, not recommendations or financial advice. They're ranked on figures "
+               f"only, so check each one yourself before buying.")
     market = st.selectbox("Market", list(IDEAS_MARKETS))
+    sorts = ETF_SORTS if etf_mode else IDEA_SORTS
     c1, c2 = st.columns(2)
-    sort_by = c1.selectbox("Sort by", list(IDEA_SORTS))
-    include_watch = c2.checkbox("Include \"on watch\" stocks", value=False)
-    include_manual = c2.checkbox("Include stocks that need a manual business check", value=True)
+    sort_by = c1.selectbox("Sort by", list(sorts))
+    include_watch = c2.checkbox("Include \"on watch\" " + ("ETFs" if etf_mode else "stocks"), value=False)
+    include_manual = c2.checkbox("Include ETFs that can't be fully checked" if etf_mode
+                                 else "Include stocks that need a manual business check", value=not etf_mode)
 
-    if st.session_state.get("ideas_market") != market:
-        if st.button(f"Find stocks in {market}", type="primary"):
-            st.session_state["ideas_market"] = market
+    kind = "etf" if etf_mode else "stock"
+    count = IDEAS_ETF_CANDIDATES if etf_mode else IDEAS_CANDIDATES
+    if st.session_state.get("ideas_search") != (market, kind):
+        if st.button(f"Find {things} in {market}", type="primary"):
+            st.session_state["ideas_search"] = (market, kind)
             st.rerun()
-        st.caption(f"Checks the {IDEAS_CANDIDATES} largest companies. The first search of the day can take a few "
-                   "minutes; after that the results are saved for 24 hours.")
+        st.caption(f"Checks the {count} largest {things}" + (" plus Islamic ETFs found by name" if etf_mode else "")
+                   + ". The first search of the day can take a few minutes; after that the results are saved "
+                     "for 24 hours.")
     else:
-        region = IDEAS_MARKETS[market]
         try:
-            with st.spinner(f"Checking the {IDEAS_CANDIDATES} largest companies in {market}… "
+            with st.spinner(f"Checking the {count} largest {things} in {market}… "
                             "this can take a few minutes the first time each day."):
-                rows, screened, when = market_ideas(region)
+                rows, screened, when = market_ideas(IDEAS_MARKETS[market], kind)
         except Exception as e:
             rows, screened, when = None, 0, ""
-            st.error(f"Couldn't get the list of companies from Yahoo Finance right now ({e}). Try again later.")
+            st.error(f"Couldn't get the list of {things} from Yahoo Finance right now ({e}). Try again later.")
 
         if rows is not None:
             allowed = {"Tier 1"} | ({"Tier 2"} if include_watch else set())
-            keep = [r for r in rows if r["s"]["tier"] in allowed
-                    and (r["s"]["business"] == "Pass" or (include_manual and r["s"]["business"] == "Review"))]
-            key, desc = IDEA_SORTS[sort_by]
+            if etf_mode:
+                keep = [r for r in rows if r["s"]["tier"] in allowed or (include_manual and r["s"]["tier"] == "Incomplete")]
+            else:
+                keep = [r for r in rows if r["s"]["tier"] in allowed
+                        and (r["s"]["business"] == "Pass" or (include_manual and r["s"]["business"] == "Review"))]
+            key, desc = sorts[sort_by]
             have = [r for r in keep if r[key] is not None]
             have.sort(key=lambda r: r[key], reverse=desc)
             top = have[:IDEAS_SHOW]
-            st.caption(f"{len(keep)} of {screened} companies passed · screened {when} · source: Yahoo Finance"
+            st.caption(f"{len(keep)} of {screened} {things} passed · screened {when} · source: Yahoo Finance"
                        + (f" · {len(keep) - len(have)} left out because their {sort_by.lower()} figure is missing"
                           if len(have) < len(keep) else ""))
             if not top:
-                st.info("No companies passed with these settings. Try including \"on watch\" stocks or ones that "
-                        "need a manual check.")
+                st.info(f"No {things} passed with these settings. Try including \"on watch\" ones or ones that "
+                        + ("can't be fully checked." if etf_mode else "need a manual check."))
             for i, r in enumerate(top, 1):
                 d, s = r["d"], r["s"]
-                label = TIER_STYLE[s["tier"]][0] + (" · needs manual check" if s["business"] == "Review" else "")
-                figures = [f"Value {money(r['market_cap'], d['price_ccy'])}" if r["market_cap"] else None,
+                label = TIER_STYLE[s["tier"]][0]
+                if s.get("islamic"):
+                    label = "Islamic fund"
+                elif s["business"] == "Review":
+                    label += " · needs manual check"
+                figures = [f"{'Size' if etf_mode else 'Value'} {money(r['market_cap'], d['price_ccy'])}" if r["market_cap"] else None,
                            f"Dividend yield {r['yield']:.1%}",
                            f"1-year {r['ret_1y']:+.0%}" if r["ret_1y"] is not None else None,
+                           f"Fees {r['fee']:.2%} a year" if r.get("fee") is not None else None,
                            f"P/E {r['pe']:.1f}" if r["pe"] else None,
                            f"Debt {r['debt']:.0%}" if r["debt"] is not None else None]
                 with st.expander(f"{i}. {d['name']} ({d['symbol']}) · {label}"):
                     st.write(" · ".join(f for f in figures if f))
-                    st.write(f"Industry: {d['industry'] or 'unknown'}")
-                    if s["business"] == "Review":
-                        st.markdown(f'<div class="note">{html.escape(s["why"])}</div>', unsafe_allow_html=True)
-                    for name, v in s["ratios"].items():
-                        ratio_bar(name, v)
+                    if etf_mode:
+                        st.write(s["why"])
+                        if s.get("note"):
+                            st.markdown(f'<div class="note">{html.escape(s["note"])}</div>', unsafe_allow_html=True)
+                    else:
+                        st.write(f"Industry: {d['industry'] or 'unknown'}")
+                        if s["business"] == "Review":
+                            st.markdown(f'<div class="note">{html.escape(s["why"])}</div>', unsafe_allow_html=True)
+                        for name, v in s["ratios"].items():
+                            ratio_bar(name, v)
                     source_line(d)
+                    research_buttons(d)
                     st.caption("For the full check, search for this code in the \"Check\" tab.")
 
 with tab_mine:
@@ -1063,7 +1167,8 @@ Funds with Islamic, Shariah or Halal in their name have their own Shariah board,
 with the WattleFolio check of their holdings alongside. Dividend cleaning uses the average of the holdings checked.
 
 **7. Find stocks.** Lists the largest companies in a market that pass the WattleFolio rules, sorted by the
-figure you choose. Banks and insurers are left out before screening. These are ideas to research, not
+figure you choose. Banks and insurers are left out before screening. Tick **ETFs only** to look through the
+largest ETFs instead (plus Islamic ETFs found by name), sorted by size, dividend yield, 1-year change or fees. These are ideas to research, not
 recommendations. The list is worked out once a day, so the first search of the day takes a few minutes.
 
 **How the WattleFolio rules compare with the main standards.** Our rules are closest to Dow Jones Islamic
@@ -1082,7 +1187,9 @@ The standards only count interest-earning cash, so cash-rich companies can look 
 15 minutes (the exchange may delay them about 20 minutes). Company figures refresh every 6 hours and use the
 newest report Yahoo has: the latest half-year or quarterly balance sheet if it's newer than the annual
 report, and revenue from the latest annual report. Each stock shows the dates under its result, and
-"More detail" lists exactly which report each figure comes from, with links to check them.
+"More detail" lists exactly which report each figure comes from. The buttons under each result open Yahoo Finance,
+the company's annual reports (ASX announcements, SEC 10-K filings or Bursa Malaysia announcements), its website,
+and a search for its latest annual report, so you can check the figures yourself.
 
 Figures can be delayed or incomplete. This app is a calculator,
 not a fatwa or financial advice. Check with a scholar you trust.
