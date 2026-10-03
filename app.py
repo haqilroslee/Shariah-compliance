@@ -659,8 +659,8 @@ def research_links(d):
     code = sym.split(".")[0]
     yahoo = f"https://finance.yahoo.com/quote/{sym}"
     links = [("Yahoo Finance", f"{yahoo}/")]
-    links += [("Financials", f"{yahoo}/financials/"), ("Company profile", f"{yahoo}/profile/")] if stock \
-        else [("Holdings", f"{yahoo}/holdings/")]
+    if stock:
+        links += [("Financials", f"{yahoo}/financials/"), ("Company profile", f"{yahoo}/profile/")]
     if sym.upper().endswith(".AX"):
         links.append(("Annual reports (ASX)" if stock else "ASX announcements",
                       f"https://www.asx.com.au/markets/trade-our-cash-market/announcements.{code.lower()}"))
