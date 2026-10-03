@@ -135,6 +135,13 @@ html, body, .stApp, .stApp p, .stApp li, .stApp input, .stApp button, .stApp lab
            background: var(--wf-surface); color: var(--wf-primary) !important; font-size: 0.85rem; font-weight: 600;
            text-decoration: none !important; white-space: nowrap; }
 .links a:hover { border-color: var(--wf-primary); }
+.mix { margin: 0.4rem 0 1rem; }
+.mixbar { display: flex; height: 14px; border-radius: 7px; overflow: hidden; background: var(--wf-bar); margin-bottom: 0.5rem; }
+.mix .line { display: flex; justify-content: space-between; gap: 0.75rem; font-size: 0.95rem; padding: 0.15rem 0; }
+.mix .line span:last-child { white-space: nowrap; }
+.mix small { opacity: 0.7; }
+.dot { display: inline-block; width: 0.7rem; height: 0.7rem; border-radius: 50%; margin-right: 0.45rem; vertical-align: baseline;
+       box-shadow: inset 0 0 0 1px var(--wf-line); }
 .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 0.75rem; margin: 0.5rem 0 1rem; }
 .card { border: 1px solid var(--wf-line); border-radius: 8px; padding: 0.8rem 1rem; background: var(--wf-surface);
         box-shadow: 0 1px 2px rgba(0,0,0,0.04); }
@@ -508,6 +515,25 @@ def holding_candidates(sym, fund_symbol):
     return [sym]
 
 
+MIX_GROUPS = [("Compliant", "var(--wf-good)"), ("Needs review", "var(--wf-watch)"),
+              ("Not compliant", "var(--wf-bad)"), ("Couldn't check", "var(--wf-muted)")]
+
+
+def holdings_mix(rows):
+    """Share of the whole fund (by weight) in each result group, plus the part Yahoo doesn't list."""
+    mix = {g: {"weight": 0.0, "count": 0} for g, _ in MIX_GROUPS}
+    for r in rows:
+        mix[r["group"]]["weight"] += r["Weight"]
+        mix[r["group"]]["count"] += 1
+    listed = sum(m["weight"] for m in mix.values())
+    if listed > 1:   # rounding in Yahoo's weights
+        for m in mix.values():
+            m["weight"] /= listed
+        listed = 1.0
+    watch = sum(r["Weight"] for r in rows if r["group"] == "Compliant" and r["tier"] == "Tier 2")
+    return {"groups": mix, "unlisted": max(0.0, 1 - listed), "watch": watch, "total": len(rows)}
+
+
 def screen_fund(f):
     """Look through an ETF's published top holdings and screen each one with the WattleFolio rules."""
     islamic = any(w in f["name"].lower() for w in ISLAMIC_FUND_WORDS)
@@ -521,11 +547,15 @@ def screen_fund(f):
                 break
             d = None
         if d is None:
-            rows.append({"Holding": name, "Code": sym, "Weight": weight, "Result": "Couldn't check", "tier": "Incomplete"})
+            rows.append({"Holding": name, "Code": sym, "Weight": weight, "Result": "Couldn't check", "tier": "Incomplete",
+                         "group": "Couldn't check"})
             continue
         hs = screen(d)
         result = TIER_STYLE[hs["tier"]][0] + (" (needs manual check)" if hs["business"] == "Review" else "")
-        rows.append({"Holding": d["name"], "Code": d["symbol"], "Weight": weight, "Result": result, "tier": hs["tier"]})
+        group = ("Couldn't check" if hs["tier"] == "Incomplete" else "Not compliant" if hs["tier"] == "Tier 3"
+                 else "Needs review" if hs["business"] == "Review" else "Compliant")
+        rows.append({"Holding": d["name"], "Code": d["symbol"], "Weight": weight, "Result": result, "tier": hs["tier"],
+                     "group": group})
         if hs["tier"] == "Incomplete":
             continue
         checked += weight
@@ -562,7 +592,7 @@ def screen_fund(f):
         "tier": tier, "business": "Pass", "why": why, "action": action, "note": note,
         "purge_pct": purge_sum / checked if checked else 0.0,
         "purge_source": f"average of the top holdings checked, {checked:.0%} of the fund" if checked else "",
-        "rows": rows, "checked": checked, "islamic": islamic,
+        "rows": rows, "checked": checked, "islamic": islamic, "mix": holdings_mix(rows),
     }
 
 
@@ -740,11 +770,31 @@ def standards_table(s):
                "so cash-rich companies can look worse than they really are.")
 
 
+def mix_bar(s):
+    """Stacked bar and legend: how much of the fund is compliant, needs review, not compliant, unknown."""
+    mix = s.get("mix")
+    if not mix or not mix["total"]:
+        return
+    parts = [(g, colour, mix["groups"][g]["weight"], mix["groups"][g]["count"]) for g, colour in MIX_GROUPS]
+    parts.append(("Not listed by Yahoo", "var(--wf-bar)", mix["unlisted"], None))
+    bar = "".join(f'<div style="width:{w * 100:.2f}%;background:{c}"></div>' for _, c, w, _ in parts if w > 0)
+    legend = []
+    for g, c, w, n in parts:
+        if w <= 0 and g != "Compliant":
+            continue
+        extra = f" ({mix['watch']:.1%} on watch)" if g == "Compliant" and mix["watch"] > 0 else ""
+        count = f"{n} holding{'s' if n != 1 else ''}" if n is not None else "rest of the fund"
+        legend.append(f'<div class="line"><span><i class="dot" style="background:{c}"></i>{g}{extra}</span>'
+                      f'<span><b>{w:.1%}</b> <small>· {count}</small></span></div>')
+    st.markdown(f'<div class="mix"><div class="mixbar">{bar}</div>{"".join(legend)}</div>', unsafe_allow_html=True)
+
+
 def fund_detail(d, s):
     st.subheader("Why")
     st.write(s["why"])
     if s["rows"]:
         st.subheader("What's inside")
+        mix_bar(s)
         st.caption(f"The {len(s['rows'])} biggest holdings Yahoo Finance publishes, each checked with the WattleFolio rules.")
         st.markdown("".join(
             f'<div class="holding"><div><div class="nm">{html.escape(r["Holding"])}</div>'
@@ -1043,6 +1093,7 @@ with tab_ideas:
                     st.write(" · ".join(f for f in figures if f))
                     if etf_mode:
                         st.write(s["why"])
+                        mix_bar(s)
                         if s.get("note"):
                             st.markdown(f'<div class="note">{html.escape(s["note"])}</div>', unsafe_allow_html=True)
                     else:
@@ -1165,6 +1216,8 @@ with the rules above. An ETF is not compliant if any of them fails, or if more t
 If they all pass but don't make up the whole fund, it shows "Can't tell yet", because the rest can't be seen.
 Funds with Islamic, Shariah or Halal in their name have their own Shariah board, so they're shown as compliant,
 with the WattleFolio check of their holdings alongside. Dividend cleaning uses the average of the holdings checked.
+Each ETF also shows how much of the fund (by weight) is compliant, needs review, is not compliant, couldn't be
+checked, or isn't listed by Yahoo.
 
 **7. Find stocks.** Lists the largest companies in a market that pass the WattleFolio rules, sorted by the
 figure you choose. Banks and insurers are left out before screening. Tick **ETFs only** to look through the
