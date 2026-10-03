@@ -75,6 +75,10 @@ def parse_holdings_file(data, filename):
 
     as_of = ""
     for row in rows[:header_at]:
+        cells = [c.strip() for c in row if c and c.strip()]
+        if len(cells) >= 2 and _norm(cells[0]) in {"date", "as of date", "as at date", "holdings date", "effective date"}:
+            as_of = cells[1]   # e.g. BetaShares: "Date,2026-10-01"
+            break
         m = re.search(r"\bas (?:of|at)\b[:\s]*([0-9A-Za-z ,/\-]{6,20})", " ".join(row), re.I)
         if m:
             as_of = m.group(1).strip(" ,")
