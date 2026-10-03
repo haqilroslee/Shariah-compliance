@@ -16,6 +16,8 @@ import yfinance as yf
 TIER1_MAX = 0.30          # Tier 1: highest ratio <= 30%
 TIER2_MAX = 0.33          # Tier 2: 30.1% - 33%; above = Tier 3
 REVENUE_LIMIT = 0.05      # non-permissible revenue must be below 5%
+PRE_REVENUE_SHARE = 0.5   # interest above this share of revenue = no real sales yet (explorers, biotechs): manual check, not auto-fail
+STALE_DAYS = 450          # warn when the latest company figures are older than this
 EXIT_DAYS = 60            # orderly liquidation window for Tier 3
 ZAKAT_RATE = 0.025        # 2.5% of Tier 1 & 2 market value
 # Other standards, shown for comparison only (they don't change the tier)
@@ -238,6 +240,7 @@ def fetch(symbol):
         "dps_12m": dividends_12m(t, divisor),
         "mcap": float(closes.iloc[-1]) * shares * conv,
         "as_of": bs.columns[0].strftime("%d %b %Y"),
+        "as_of_days": (pd.Timestamp.now() - pd.Timestamp(bs.columns[0]).tz_localize(None)).days,
     }
 
 
@@ -289,7 +292,7 @@ def standards(d, failed_business):
     results = {}
     for name, (basis, tests) in out.items():
         if failed_business:
-            result = "Fail"
+            result = "Fail (business)"
         elif any(v is None for _, v, _ in tests):
             result = "n/a"
         else:
@@ -320,12 +323,14 @@ def screen(d):
         if review is not None and review["non_permissible_revenue_pct"].strip():
             np_source += "; the family figure in sector_review.csv couldn't be read"
 
+    # Almost no sales yet (explorers, biotechs): interest on cash dwarfs revenue, so the 5% test says little
+    pre_revenue = np_source.startswith("estimate") and np_pct is not None and np_pct >= PRE_REVENUE_SHARE
     checked_by = "family" if review is not None and review["excluded"].strip().lower() in ("yes", "no") else "automatic"
     if review is not None and review["excluded"].strip().lower() == "yes":
         business, why = "Fail", "The family review marked this business as excluded."
     elif review is None and any(k in industry for k in EXCLUDED_KEYWORDS):
         business, why = "Fail", f"Its industry ({d['industry']}) is on the excluded list."
-    elif np_pct is not None and np_pct >= REVENUE_LIMIT:
+    elif np_pct is not None and np_pct >= REVENUE_LIMIT and not pre_revenue:
         business, why = "Fail", f"{np_pct:.1%} of revenue comes from non-permissible sources (limit is under 5%)."
     elif checked_by == "family":
         business, why = "Pass", "Business activities checked by the family."
@@ -341,6 +346,9 @@ def screen(d):
             reasons.append(f"Its company description mentions: {', '.join(flags)}.")
         elif not d.get("summary"):
             reasons.append("Yahoo Finance has no description of what it does.")
+        if pre_revenue:
+            reasons.append(f"It has almost no sales yet: {np_pct:.0%} of its revenue is interest on its cash, "
+                           f"so the 5% revenue test doesn't say much. This is common for explorers and biotechs.")
         if np_pct is None:
             reasons.append("Its revenue figures are missing, so interest income can't be checked.")
         if reasons:
@@ -369,7 +377,7 @@ def screen(d):
         tier = "Tier 1"
 
     return {
-        "tier": tier, "business": business, "checked_by": checked_by, "why": why, "ratios": r, "highest": highest,
+        "tier": tier, "business": business, "checked_by": checked_by, "pre_revenue": pre_revenue, "why": why, "ratios": r, "highest": highest,
         "purge_pct": np_pct or 0.0, "purge_source": np_source,
         "standards": standards(d, business == "Fail"),
     }
@@ -492,7 +500,7 @@ def cards(items):
 def standards_table(s):
     def pct(v):
         return "–" if v is None else f"{v:.1%}"
-    cards([(name, pill(result, {"Pass": "Tier 1", "Fail": "Tier 3"}.get(result, "Incomplete")), f"vs {basis}",
+    cards([(name, pill(result, "Tier 1" if result == "Pass" else "Tier 3" if result.startswith("Fail") else "Incomplete"), f"vs {basis}",
             [(t, f"{pct(v)} <small>/ max {limit * 100:g}%</small>", v is not None and v > limit) for t, v, limit in tests])
            for name, (basis, tests, result) in s["standards"].items()])
     st.caption("For comparison only: the colour above follows the family rules. "
@@ -637,6 +645,10 @@ with tab_check:
                 s = screen(d)
                 verdict_card(d, s)
 
+                if d.get("as_of_days", 0) > STALE_DAYS:
+                    st.warning(f"These company figures are from {d['as_of']}, over a year old. Yahoo Finance may be "
+                               f"missing the latest reports, so check the company's latest annual report too.")
+
                 st.subheader("Why")
                 if s["business"] == "Fail":
                     st.write(s["why"])
@@ -649,6 +661,9 @@ with tab_check:
                 st.subheader("Cleaning dividends")
                 st.write(f"Give **{s['purge_pct']:.2%}** of every dividend from this company to charity "
                          f"({s['purge_source'] or 'no revenue data'}).")
+                if s.get("pre_revenue"):
+                    st.caption("This is high because the company has almost no sales yet, so most of its income is "
+                               "interest on its cash. Companies at this stage rarely pay dividends.")
 
                 with st.expander("More detail"):
                     by = f" ({s['checked_by']})" if s["business"] != "Review" else ""
