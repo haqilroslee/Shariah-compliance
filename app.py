@@ -4,8 +4,12 @@ Screening rules follow the WattleFolio methodology (tiers at 30% / 33%, 5% reven
 24-month average market cap, 60-day exit window, purging, 2.5% zakat).
 """
 import base64
+import csv
 import html
+import io
 import math
+import os
+import urllib.request
 import re
 from urllib.parse import quote_plus
 from concurrent.futures import ThreadPoolExecutor
@@ -35,6 +39,12 @@ INCLUDE_LEASES = True     # count lease liabilities as interest-bearing debt
 ISLAMIC_FUND_WORDS = ["islamic", "shariah", "sharia", "syariah", "halal"]   # in a fund's name = has its own Shariah board
 FUND_FULL_COVERAGE = 0.99  # share of an ETF the published holdings must cover to give a full verdict
 FUND_MAX_BONDS = 0.01     # conventional bonds pay interest; more than this fails an ETF
+# Full ETF holdings lists (uploaded, saved in etf_holdings/, or downloaded from SPDR): check the largest holdings
+# until this much of the fund is covered, up to a maximum number. A full list that reaches the target can pass.
+ETF_FULL_TARGET = 0.95
+ETF_FULL_MAX = 150
+HOLDINGS_DIR = "etf_holdings"
+SPDR_HOLDINGS_URL = "https://www.ssga.com/us/en/intermediary/etfs/library-content/products/fund-data/etfs/us/holdings-daily-us-en-{}.xlsx"
 # "Find stocks" tab: the largest companies in a market are screened, then the best compliant ones listed
 IDEAS_MARKETS = {"Australia (ASX)": "au", "United States": "us", "Malaysia (Bursa)": "my"}
 IDEAS_CANDIDATES = 100    # how many of the largest companies to screen (more = slower first load)
@@ -530,91 +540,289 @@ def screen(d):
     }
 
 
-def holding_candidates(sym, fund_symbol):
-    """Yahoo often lists a fund's local holdings without the exchange suffix (CBA rather than CBA.AX)."""
-    if "." not in sym and "." in fund_symbol:
-        return [sym + fund_symbol[fund_symbol.rfind("."):], sym]
-    return [sym]
+# ----------------------------------------------------------------------------- full ETF holdings files
+# Exchange codes used in provider files (Bloomberg style, e.g. "BHP AU") and countries -> Yahoo code endings
+EXCHANGE_SUFFIX = {"AU": ".AX", "AT": ".AX", "US": "", "UN": "", "UW": "", "UQ": "", "UP": "", "UA": "", "LN": ".L",
+                   "JP": ".T", "JT": ".T", "HK": ".HK", "CN": ".TO", "CT": ".TO", "GR": ".DE", "GY": ".DE", "FP": ".PA",
+                   "NA": ".AS", "SW": ".SW", "SE": ".SW", "SS": ".ST", "DC": ".CO", "SM": ".MC", "IM": ".MI", "KS": ".KS",
+                   "TT": ".TW", "SP": ".SI", "MK": ".KL", "NZ": ".NZ", "BB": ".BR", "FH": ".HE", "NO": ".OL", "ID": ".IR"}
+COUNTRY_SUFFIX = {"australia": ".AX", "united states": "", "united states of america": "", "usa": "", "us": "",
+                  "united kingdom": ".L", "uk": ".L", "japan": ".T", "hong kong": ".HK", "canada": ".TO", "germany": ".DE",
+                  "france": ".PA", "netherlands": ".AS", "switzerland": ".SW", "sweden": ".ST", "denmark": ".CO",
+                  "spain": ".MC", "italy": ".MI", "korea": ".KS", "south korea": ".KS", "korea, republic of": ".KS",
+                  "taiwan": ".TW", "singapore": ".SI", "malaysia": ".KL", "new zealand": ".NZ", "belgium": ".BR",
+                  "finland": ".HE", "norway": ".OL", "ireland": ".IR"}
+TICKER_COLS = {"ticker", "code", "asx code", "symbol", "ticker symbol", "security code", "exchange ticker", "local ticker",
+               "bloomberg ticker", "stock code", "ticker code"}
+NAME_COLS = {"name", "holding", "holding name", "holdings", "security name", "security", "description",
+             "security description", "company", "company name", "issuer name", "issuer", "stock", "asset name"}
+CLASS_COLS = {"asset class", "security type", "asset type", "type", "sector", "asset class category", "instrument type"}
+NOT_SHARES = re.compile(r"\b(cash|futures?|forwards?|currency|currencies|margin|unsettled|receivables?|payables?|"
+                        r"money market|swaps?|options?|derivatives?|fx)\b", re.I)
+
+
+def _norm(cell):
+    return re.sub(r"[^a-z%]+", " ", str(cell).lower()).strip()
+
+
+def _is_weight_col(n):
+    return n in {"weight", "weight %", "weighting", "% weight", "% of net assets", "% net assets", "% of fund",
+                 "% of funds", "portfolio weight", "market value %", "% of market value"} or \
+        "weight" in n or ("%" in n and any(w in n for w in ("net assets", "fund", "portfolio", "market value")))
+
+
+def _rows_from_file(data, filename):
+    """All rows of a CSV or Excel file as lists of strings (first sheet that has a holdings table)."""
+    if filename.lower().endswith((".xlsx", ".xls")):
+        sheets = pd.read_excel(io.BytesIO(data), header=None, sheet_name=None, dtype=str)
+        return [[("" if pd.isna(c) else str(c)) for c in row] for df in sheets.values() for row in df.itertuples(index=False)]
+    text = data.decode("utf-8-sig", errors="replace")
+    delim = max([",", ";", "\t"], key=lambda d: text[:5000].count(d))
+    return [row for row in csv.reader(io.StringIO(text), delimiter=delim)]
+
+
+def parse_holdings_file(data, filename):
+    """Read a provider's full holdings file (Vanguard, BetaShares, SPDR and similar layouts).
+
+    Returns {"entries": [{"ticker", "name", "weight", "country", "cash"}], "as_of": text or ""}.
+    Raises ValueError if no holdings table can be found."""
+    rows = _rows_from_file(data, filename)
+    header_at, cols = None, {}
+    for i, row in enumerate(rows[:60]):
+        names = [_norm(c) for c in row]
+        weight = next((j for j, n in enumerate(names) if _is_weight_col(n)), None)
+        ticker = next((j for j, n in enumerate(names) if n in TICKER_COLS), None)
+        name = next((j for j, n in enumerate(names) if n in NAME_COLS), None)
+        if weight is not None and (ticker is not None or name is not None):
+            header_at = i
+            cols = {"weight": weight, "ticker": ticker, "name": name,
+                    "country": next((j for j, n in enumerate(names) if "country" in n or n == "location"), None),
+                    "class": next((j for j, n in enumerate(names) if n in CLASS_COLS), None)}
+            break
+    if header_at is None:
+        raise ValueError("couldn't find a table with holding names and weights in this file")
+
+    def cell(row, key):
+        j = cols[key]
+        return row[j].strip() if j is not None and j < len(row) else ""
+
+    as_of = ""
+    for row in rows[:header_at]:
+        m = re.search(r"\bas (?:of|at)\b[:\s]*([0-9A-Za-z ,/\-]{6,20})", " ".join(row), re.I)
+        if m:
+            as_of = m.group(1).strip(" ,")
+            break
+    entries = []
+    for row in rows[header_at + 1:]:
+        raw = cell(row, "weight").replace("%", "").replace(",", "").strip()
+        if raw.startswith("(") and raw.endswith(")"):
+            raw = "-" + raw[1:-1]
+        try:
+            weight = float(raw)
+        except ValueError:
+            continue
+        ticker, name, klass = cell(row, "ticker"), cell(row, "name"), cell(row, "class")
+        if not ticker and not name:
+            continue
+        cash = bool(NOT_SHARES.search(klass) or (NOT_SHARES.search(name) and not ticker.strip("- ")) or
+                    ticker.upper() in {"CASH", "-", "--", "N/A"} or re.search(r"\b(cash|futures?|currency)\b", name, re.I))
+        entries.append({"ticker": "" if ticker in {"-", "--"} else ticker, "name": name or ticker, "weight": weight,
+                        "country": cell(row, "country"), "cash": cash})
+    if not entries:
+        raise ValueError("found the table but no holdings with weights")
+    total = sum(e["weight"] for e in entries)
+    if total > 1.5:   # weights given as percentages
+        for e in entries:
+            e["weight"] /= 100
+    return {"entries": entries, "as_of": as_of}
+
+
+def yahoo_candidates(ticker, country, fund_symbol):
+    """Yahoo codes to try for a holding: handles "BHP AU", "BRK.B", country columns and missing exchange endings."""
+    parts = ticker.upper().replace(" EQUITY", "").split()
+    if not parts:
+        return []
+    base, suffix = parts[0], None
+    if len(parts) >= 2 and parts[-1] in EXCHANGE_SUFFIX:
+        suffix = EXCHANGE_SUFFIX[parts[-1]]
+    elif "." in base and base.rsplit(".", 1)[1] in {"AX", "L", "T", "HK", "TO", "DE", "PA", "AS", "SW", "KL", "SI", "NZ"}:
+        return [base]   # already a Yahoo code
+    if suffix is None and country:
+        suffix = COUNTRY_SUFFIX.get(country.strip().lower())
+    us = base.replace(".", "-").replace("/", "-")
+    if suffix == "":
+        return [us]
+    if suffix is not None:
+        if suffix == ".HK" and base.isdigit():
+            base = base.zfill(4)
+        return [base.replace("/", "-") + suffix]
+    if "." in fund_symbol:   # local fund, local holdings listed without their exchange ending (CBA rather than CBA.AX)
+        return [base + fund_symbol[fund_symbol.rfind("."):], us]
+    return [us]
+
+
+@st.cache_data(ttl=12 * 3600, show_spinner=False)
+def download_file(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (WattleFolio Shariah Checker)"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return r.read()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _saved_holdings(path, mtime):
+    with open(path, "rb") as f:
+        return parse_holdings_file(f.read(), path)
+
+
+def saved_holdings(symbol):
+    """A holdings file saved in etf_holdings/ named after the fund, e.g. VAS.AX.csv, SPY.xlsx (or VAS.csv)."""
+    if not os.path.isdir(HOLDINGS_DIR):
+        return None, ""
+    wanted = {symbol.upper(), symbol.split(".")[0].upper()}
+    for fn in sorted(os.listdir(HOLDINGS_DIR)):
+        stem, ext = os.path.splitext(fn)
+        if ext.lower() in (".csv", ".xlsx", ".xls") and stem.upper() in wanted:
+            path = os.path.join(HOLDINGS_DIR, fn)
+            try:
+                return _saved_holdings(path, os.path.getmtime(path)), fn
+            except Exception:
+                return None, ""
+    return None, ""
+
+
+def provider_holdings(f):
+    """Download the full list straight from the provider where that's automatic (SPDR / State Street US ETFs)."""
+    sym, family = f["symbol"], (f.get("family") or "").lower()
+    if "." in sym or not ("spdr" in family or "state street" in family or sym.upper() in {"SPY", "SPLG", "MDY", "DIA"}):
+        return None
+    try:
+        return parse_holdings_file(download_file(SPDR_HOLDINGS_URL.format(sym.lower())), "spdr.xlsx")
+    except Exception:
+        return None
+
+
+def fund_holdings(f, allow_upload=True):
+    """Best holdings list available: (entries, where it came from, as-of date, is it the full list?)."""
+    up = st.session_state.get("uploaded_holdings", {}).get(f["symbol"].upper()) if allow_upload else None
+    if up:
+        return up["entries"], f"your uploaded file ({up['file']})", up["as_of"], True
+    saved, fn = saved_holdings(f["symbol"])
+    if saved:
+        return saved["entries"], f"the saved holdings file ({fn})", saved["as_of"], True
+    auto = provider_holdings(f)
+    if auto:
+        return auto["entries"], "State Street SPDR's daily holdings file", auto["as_of"], True
+    return ([{"ticker": t, "name": n, "weight": w, "country": "", "cash": False} for t, n, w in f["holdings"]],
+            "Yahoo Finance (top holdings only)", "", False)
 
 
 MIX_GROUPS = [("Compliant", "var(--wf-good)"), ("Needs review", "var(--wf-watch)"),
               ("Not compliant", "var(--wf-bad)"), ("Couldn't check", "var(--wf-muted)")]
 
 
-def holdings_mix(rows):
-    """Share of the whole fund (by weight) in each result group, plus the part Yahoo doesn't list."""
+def holdings_mix(rows, extras):
+    """Share of the whole fund (by weight) in each result group, plus extras such as cash or unchecked holdings."""
     mix = {g: {"weight": 0.0, "count": 0} for g, _ in MIX_GROUPS}
     for r in rows:
         mix[r["group"]]["weight"] += r["Weight"]
         mix[r["group"]]["count"] += 1
-    listed = sum(m["weight"] for m in mix.values())
-    if listed > 1:   # rounding in Yahoo's weights
-        for m in mix.values():
-            m["weight"] /= listed
-        listed = 1.0
     watch = sum(r["Weight"] for r in rows if r["group"] == "Compliant" and r["tier"] == "Tier 2")
-    return {"groups": mix, "unlisted": max(0.0, 1 - listed), "watch": watch, "total": len(rows)}
+    return {"groups": mix, "extras": [x for x in extras if x[2] > 0.0005], "watch": watch, "total": len(rows)}
 
 
-def screen_fund(f):
-    """Look through an ETF's published top holdings and screen each one with the WattleFolio rules."""
+def check_holding(e, fund_symbol):
+    for cand in yahoo_candidates(e["ticker"], e.get("country", ""), fund_symbol):
+        d, _ = get_data(cand)
+        if d is not None and d["kind"] == "stock":
+            return d, screen(d)
+    return None, None
+
+
+def screen_fund(f, allow_upload=True):
+    """Look through an ETF's holdings (the full list where available) and screen each one with the WattleFolio rules."""
     islamic = any(w in f["name"].lower() for w in ISLAMIC_FUND_WORDS)
+    entries, source, as_of, full = fund_holdings(f, allow_upload)
+    shares = sorted((e for e in entries if not e["cash"]), key=lambda e: -e["weight"])
+    cash_w = sum(e["weight"] for e in entries if e["cash"])
+    if full:   # largest first, until the target share of the fund is covered
+        picked, cum = [], cash_w
+        for e in shares:
+            if cum >= ETF_FULL_TARGET or len(picked) >= ETF_FULL_MAX:
+                break
+            picked.append(e)
+            cum += e["weight"]
+    else:
+        picked = shares
+
+    ctx = get_script_run_ctx()
+    with ThreadPoolExecutor(max_workers=6, initializer=lambda: add_script_run_ctx(None, ctx)) as pool:
+        results = list(pool.map(lambda e: check_holding(e, f["symbol"]), picked))
+
     rows, failed, watch = [], [], False
     checked, purge_sum = 0.0, 0.0
-    for sym, name, weight in f["holdings"]:
-        d = None
-        for cand in holding_candidates(sym, f["symbol"]):
-            d, _ = get_data(cand)
-            if d is not None and d["kind"] == "stock":
-                break
-            d = None
+    for e, (d, hs) in zip(picked, results):
         if d is None:
-            rows.append({"Holding": name, "Code": sym, "Weight": weight, "Result": "Couldn't check", "tier": "Incomplete",
-                         "group": "Couldn't check"})
+            rows.append({"Holding": e["name"], "Code": e["ticker"], "Weight": e["weight"], "Result": "Couldn't check",
+                         "tier": "Incomplete", "group": "Couldn't check"})
             continue
-        hs = screen(d)
         result = TIER_STYLE[hs["tier"]][0] + (" (needs manual check)" if hs["business"] == "Review" else "")
         group = ("Couldn't check" if hs["tier"] == "Incomplete" else "Not compliant" if hs["tier"] == "Tier 3"
                  else "Needs review" if hs["business"] == "Review" else "Compliant")
-        rows.append({"Holding": d["name"], "Code": d["symbol"], "Weight": weight, "Result": result, "tier": hs["tier"],
-                     "group": group})
+        rows.append({"Holding": d["name"], "Code": d["symbol"], "Weight": e["weight"], "Result": result,
+                     "tier": hs["tier"], "group": group})
         if hs["tier"] == "Incomplete":
             continue
-        checked += weight
-        purge_sum += weight * hs["purge_pct"]
+        checked += e["weight"]
+        purge_sum += e["weight"] * hs["purge_pct"]
         if hs["tier"] == "Tier 3":
             failed.append(d["name"])
         watch = watch or hs["tier"] == "Tier 2"
 
+    listed = sum(e["weight"] for e in entries)
+    unchecked = sum(e["weight"] for e in shares[len(picked):])
+    extras = [("Cash & other (not shares)", "var(--wf-line)", cash_w, "cash, futures, currency")]
+    if full:
+        extras.append(("Smaller holdings not checked", "var(--wf-bar)", unchecked, f"{len(shares) - len(picked)} holdings"))
+    else:
+        extras.append(("Not listed by Yahoo", "var(--wf-bar)", max(0.0, 1 - listed), "rest of the fund"))
+    coverage_needed = ETF_FULL_TARGET if full else FUND_FULL_COVERAGE
+    covered = checked + cash_w
     action, note = None, None
     if islamic:
         tier = "Tier 1"
         action = "An Islamic fund: it is screened by its own Shariah board. Check which standard it follows."
         why = "The fund's name says it is Shariah-compliant, so it follows its own Shariah board's rules."
         if failed:
-            note = (f"Under the WattleFolio rules, {len(failed)} of its top holdings would not be compliant "
-                    f"({', '.join(failed)}). Its board may use a different standard.")
+            note = (f"Under the WattleFolio rules, {len(failed)} of its holdings would not be compliant "
+                    f"({', '.join(failed[:8])}{' and others' if len(failed) > 8 else ''}). Its board may use a different standard.")
     elif f["bonds"] > FUND_MAX_BONDS:
         tier, why = "Tier 3", f"{f['bonds']:.0%} of the fund is in bonds, which pay interest."
     elif failed:
-        tier, why = "Tier 3", f"It holds companies that aren't compliant: {', '.join(failed)}."
-    elif not f["holdings"]:
+        tier = "Tier 3"
+        why = (f"It holds {len(failed)} compan{'y that isn' if len(failed) == 1 else 'ies that aren'}'t compliant: "
+               f"{', '.join(failed[:8])}{' and others' if len(failed) > 8 else ''}.")
+    elif not entries:
         tier, why = "Incomplete", "Yahoo Finance doesn't list this fund's holdings."
         action = "Can't see what this fund holds, so it can't be checked."
-    elif checked < FUND_FULL_COVERAGE:
+    elif covered < coverage_needed:
         tier = "Incomplete"
-        why = (f"The holdings that could be checked pass, but they're only {checked:.0%} of the fund. "
-               f"The other {1 - checked:.0%} can't be seen here.")
-        action = "Its top holdings pass, but most of the fund can't be checked here. Ask a scholar or use a certified Islamic ETF."
+        why = (f"The holdings that could be checked pass, but they're only {covered:.0%} of the fund. "
+               f"The other {1 - covered:.0%} can't be checked here.")
+        action = ("Its holdings pass so far, but not enough of the fund could be checked. Ask a scholar or use a "
+                  "certified Islamic ETF." if full else
+                  "Its top holdings pass, but most of the fund can't be checked here. Add its full holdings file, "
+                  "ask a scholar or use a certified Islamic ETF.")
     else:
         tier = "Tier 2" if watch else "Tier 1"
-        why = "Every holding passes the WattleFolio rules."
+        why = ("Every holding checked passes the WattleFolio rules"
+               + (f" ({covered:.0%} of the fund; the rest are small holdings)." if full and covered < 0.999 else "."))
 
     return {
         "tier": tier, "business": "Pass", "why": why, "action": action, "note": note,
         "purge_pct": purge_sum / checked if checked else 0.0,
-        "purge_source": f"average of the top holdings checked, {checked:.0%} of the fund" if checked else "",
-        "rows": rows, "checked": checked, "islamic": islamic, "mix": holdings_mix(rows),
+        "purge_source": f"average of the holdings checked, {checked:.0%} of the fund" if checked else "",
+        "rows": rows, "checked": checked, "islamic": islamic, "mix": holdings_mix(rows, extras),
+        "source": source, "as_of": as_of, "full": full, "total_holdings": len(shares),
     }
 
 
@@ -675,7 +883,7 @@ def market_ideas(region, kind="stock"):
             return None
         y = d["dps_12m"] / d["price"] if d.get("dps_12m") and d["price"] else 0.0
         if kind == "etf":
-            s = screen_fund(d)
+            s = screen_fund(d, allow_upload=False)
             return {"d": d, "s": s, "market_cap": d.get("size") or u["market_cap"], "pe": None, "yield": y,
                     "ret_1y": d.get("ret_1y"), "fee": d.get("fee"), "debt": None, "highest": None}
         s = screen(d)
@@ -832,17 +1040,45 @@ def mix_bar(s):
     if not mix or not mix["total"]:
         return
     parts = [(g, colour, mix["groups"][g]["weight"], mix["groups"][g]["count"]) for g, colour in MIX_GROUPS]
-    parts.append(("Not listed by Yahoo", "var(--wf-bar)", mix["unlisted"], None))
+    parts += [(label, colour, w, note) for label, colour, w, note in mix["extras"]]
     bar = "".join(f'<div style="width:{w * 100:.2f}%;background:{c}"></div>' for _, c, w, _ in parts if w > 0)
     legend = []
     for g, c, w, n in parts:
         if w <= 0 and g != "Compliant":
             continue
         extra = f" ({mix['watch']:.1%} on watch)" if g == "Compliant" and mix["watch"] > 0 else ""
-        count = f"{n} holding{'s' if n != 1 else ''}" if n is not None else "rest of the fund"
+        count = n if isinstance(n, str) else f"{n} holding{'s' if n != 1 else ''}"
         legend.append(f'<div class="line"><span><i class="dot" style="background:{c}"></i>{g}{extra}</span>'
                       f'<span><b>{w:.1%}</b> <small>· {count}</small></span></div>')
     st.markdown(f'<div class="mix"><div class="mixbar">{bar}</div>{"".join(legend)}</div>', unsafe_allow_html=True)
+
+
+def holdings_upload(d, s):
+    """Upload a provider's full holdings file for this ETF (kept for this visit)."""
+    sym = d["symbol"].upper()
+    uploaded = st.session_state.setdefault("uploaded_holdings", {})
+    with st.expander("Check every holding: add the full holdings file", expanded=sym in uploaded):
+        st.write("Fund providers publish every holding, usually updated daily. Download the file and add it here:")
+        st.markdown("- **Vanguard**: the ETF's page on vanguard.com.au → *Portfolio* → export the holdings list\n"
+                    "- **BetaShares**: the fund's page on betashares.com.au → *Holdings* → download the full holdings (CSV)\n"
+                    "- **SPDR** (e.g. SPY): downloaded automatically. On ssga.com: the fund's page → *Holdings* → "
+                    "*Daily holdings* (Excel)")
+        st.caption(f"An uploaded file is used for this visit only. To keep it for everyone, add it to the "
+                   f"`{HOLDINGS_DIR}` folder on GitHub named after the fund, e.g. `{sym}.csv` or `{sym}.xlsx`.")
+        gen = st.session_state.get("holdings_upload_gen", 0)   # bumped to empty the upload box
+        f = st.file_uploader("Holdings file (CSV or Excel)", type=["csv", "xlsx", "xls"], key=f"holdings_file_{sym}_{gen}")
+        if f is not None and uploaded.get(sym, {}).get("id") != (f.name, f.size):
+            try:
+                parsed = parse_holdings_file(f.getvalue(), f.name)
+            except Exception as e:
+                st.error(f"Couldn't read that file ({e}). Use the full holdings download from the fund's own website.")
+            else:
+                uploaded[sym] = {"id": (f.name, f.size), "file": f.name, **parsed}
+                st.rerun()
+        if sym in uploaded and st.button("Stop using the uploaded file", key=f"holdings_clear_{sym}"):
+            uploaded.pop(sym, None)
+            st.session_state["holdings_upload_gen"] = gen + 1
+            st.rerun()
 
 
 def fund_detail(d, s):
@@ -851,11 +1087,24 @@ def fund_detail(d, s):
     if s["rows"]:
         st.subheader("What's inside")
         mix_bar(s)
-        st.caption(f"The {len(s['rows'])} biggest holdings Yahoo Finance publishes, each checked with the WattleFolio rules.")
-        st.markdown("".join(
-            f'<div class="holding"><div><div class="nm">{html.escape(r["Holding"])}</div>'
-            f'<div class="meta"><span>{html.escape(r["Code"])}</span>{pill(r["Result"], r["tier"])}</div></div>'
-            f'<div class="wt">{r["Weight"]:.1%}</div></div>' for r in s["rows"]), unsafe_allow_html=True)
+        dated = f", as of {s['as_of']}" if s.get("as_of") else ""
+        if s["full"]:
+            st.caption(f"Holdings from {s['source']}{dated}: {s['total_holdings']} shares in total. The largest "
+                       f"{len(s['rows'])} were checked with the WattleFolio rules, covering {s['checked']:.0%} of the fund.")
+        else:
+            st.caption(f"The {len(s['rows'])} biggest holdings Yahoo Finance publishes, each checked with the WattleFolio "
+                       f"rules. Add the fund's full holdings file below to check the rest.")
+
+        def holding_rows(rows):
+            return "".join(
+                f'<div class="holding"><div><div class="nm">{html.escape(r["Holding"])}</div>'
+                f'<div class="meta"><span>{html.escape(r["Code"])}</span>{pill(r["Result"], r["tier"])}</div></div>'
+                f'<div class="wt">{r["Weight"]:.1%}</div></div>' for r in rows)
+        st.markdown(holding_rows(s["rows"][:15]), unsafe_allow_html=True)
+        if len(s["rows"]) > 15:
+            with st.expander(f"Show all {len(s['rows'])} holdings checked"):
+                st.markdown(holding_rows(s["rows"][15:]), unsafe_allow_html=True)
+    holdings_upload(d, s)
 
     st.subheader("Cleaning dividends")
     if s["checked"]:
@@ -870,8 +1119,7 @@ def fund_detail(d, s):
         if sectors:
             st.write("Sectors: " + " · ".join(f"{k.replace('_', ' ').title()} {v:.0%}" for k, v in sectors))
         st.write(f"Bonds: {d['bonds']:.0%} of the fund")
-        st.caption("Only the biggest holdings that Yahoo Finance publishes can be checked. "
-                   "For the full list, see the fund's own website.")
+        st.caption(f"Holdings source: {s['source']}" + (f", as of {s['as_of']}" if s.get("as_of") else "") + ".")
         source_detail(d)
 
 
@@ -1314,6 +1562,11 @@ Funds with Islamic, Shariah or Halal in their name have their own Shariah board,
 with the WattleFolio check of their holdings alongside. Dividend cleaning uses the average of the holdings checked.
 Each ETF also shows how much of the fund (by weight) is compliant, needs review, is not compliant, couldn't be
 checked, or isn't listed by Yahoo.
+
+**Full ETF holdings.** Yahoo Finance only lists an ETF's top 10 holdings. When the fund provider's full holdings
+file is available (uploaded on the ETF's page, saved in the app, or downloaded automatically for SPDR ETFs like
+SPY), the app checks the largest holdings until 95% of the fund is covered, up to 150 holdings. Cash and futures
+are shown separately. An ETF checked this way can be compliant if everything checked passes.
 
 **7. Find stocks.** Lists the largest companies in a market that pass the WattleFolio rules, sorted by the
 figure you choose. Banks and insurers are left out before screening. Tick **ETFs only** to look through the

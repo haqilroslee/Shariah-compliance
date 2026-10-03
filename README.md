@@ -69,6 +69,13 @@ companies screened is `IDEAS_CANDIDATES` at the top of `app.py`. Tick **ETFs onl
 Every result has buttons to Yahoo Finance, the company's annual reports (ASX, SEC or Bursa Malaysia), its
 website and a Google search for its annual report, for checking the figures by hand.
 
+## Full ETF holdings
+Yahoo Finance only lists an ETF's top 10 holdings. The app uses the provider's full holdings list instead when it
+can: a file uploaded on the ETF's page (for that visit), a file saved in `etf_holdings/` (permanent; see the
+README in that folder for Vanguard, BetaShares and SPDR download steps), or, for US SPDR ETFs such as SPY, the
+daily file downloaded automatically from State Street. It checks the largest holdings until `ETF_FULL_TARGET`
+(95%) of the fund is covered, up to `ETF_FULL_MAX` (150) holdings.
+
 ## Prices and currency
 Each result shows key figures (price and today's change, market value or fund size and fees, P/E, dividend
 yield, 52-week range, 1-year change). **Show prices in** at the top converts prices, values, zakat and dividend
