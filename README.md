@@ -69,6 +69,12 @@ companies screened is `IDEAS_CANDIDATES` at the top of `app.py`. Tick **ETFs onl
 Every result has buttons to Yahoo Finance, the company's annual reports (ASX, SEC or Bursa Malaysia), its
 website and a Google search for its annual report, for checking the figures by hand.
 
+## Prices and currency
+Each result shows key figures (price and today's change, market value or fund size and fees, P/E, dividend
+yield, 52-week range, 1-year change). **Show prices in** at the top converts prices, values, zakat and dividend
+cleaning into another currency at Yahoo Finance exchange rates and saves the choice in the link (`?ccy=AUD`),
+so a shared link opens in that currency. The list of currencies is `DISPLAY_CURRENCIES` in `app.py`.
+
 ## If it stops showing figures
 Yahoo Finance sometimes blocks requests from cloud servers. If every stock fails for more than a day,
 the fix is switching to a paid data source, which is a small code change.

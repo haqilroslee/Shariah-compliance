@@ -41,6 +41,8 @@ IDEAS_CANDIDATES = 100    # how many of the largest companies to screen (more = 
 IDEAS_SHOW = 50
 IDEAS_SKIP_SECTORS = ["Financial Services"]   # mostly banks and insurers, so not worth screening
 IDEAS_ETF_CANDIDATES = 60   # largest ETFs per market to look through (each one checks ~10 holdings)
+# "Show prices in" choices; the choice is kept in the page link (?ccy=AUD)
+DISPLAY_CURRENCIES = ["AUD", "USD", "SGD", "MYR", "GBP", "EUR", "NZD", "HKD", "CAD", "JPY", "IDR"]
 MARKET_SUFFIX = {"au": ".AX", "my": ".KL", "us": ""}   # Yahoo code endings, to keep name-search hits in the market
 NEXT_REVIEW = date(2027, 2, 7)   # last day of Sha'ban 1448 (approx, confirm by moon sighting)
 MANUAL_CHECK_TIP = ("Before buying, look at the company's latest annual report: check what it earns its revenue "
@@ -130,6 +132,13 @@ html, body, .stApp, .stApp p, .stApp li, .stApp input, .stApp button, .stApp lab
 .bar .tick { position: absolute; top: -4px; bottom: -4px; width: 2px; background: var(--wf-muted); }
 .row { display: flex; justify-content: space-between; font-size: 1rem; }
 .src { font-size: 0.85rem; opacity: 0.8; margin: -0.6rem 0 1rem; line-height: 1.5; }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 0.5rem; margin: 0 0 0.6rem; }
+.stat { background: var(--wf-surface); border: 1px solid var(--wf-line); border-radius: 8px; padding: 0.55rem 0.8rem; }
+.stat .k { font-size: 0.78rem; color: var(--wf-muted); }
+.stat .v { font-size: 1.15rem; font-weight: 700; margin-top: 0.1rem; white-space: nowrap; }
+.stat .s { font-size: 0.75rem; color: var(--wf-muted); margin-top: 0.1rem; }
+.up { color: var(--wf-good); font-weight: 600; }
+.down { color: var(--wf-bad); font-weight: 600; }
 .links { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: -0.4rem 0 1.1rem; }
 .links a { display: inline-block; padding: 0.3rem 0.75rem; border: 1px solid var(--wf-line); border-radius: 999px;
            background: var(--wf-surface); color: var(--wf-primary) !important; font-size: 0.85rem; font-weight: 600;
@@ -218,9 +227,10 @@ class Statement:
 
 @st.cache_data(ttl=15 * 60, show_spinner=False)
 def quote(symbol):
-    """Latest price (in the quote's own units) and its date. Refreshed every 15 minutes."""
+    """Latest price and previous close (in the quote's own units) and the price date. Refreshed every 15 minutes."""
     closes = yf.Ticker(symbol).history(period="5d", interval="1d", auto_adjust=False)["Close"].dropna()
-    return float(closes.iloc[-1]), closes.index[-1].strftime("%d %b %Y")
+    prev = float(closes.iloc[-2]) if len(closes) > 1 else None
+    return float(closes.iloc[-1]), prev, closes.index[-1].strftime("%d %b %Y")
 
 
 def days_old(ts):
@@ -266,6 +276,11 @@ def fetch_fund(t, info, symbol):
     return {
         "kind": "fund",
         "website": info.get("website") or "",
+        "exchange_name": info.get("fullExchangeName") or info.get("exchange") or "",
+        "pe": info.get("trailingPE"),
+        "market_cap_quote": info.get("marketCap"),
+        "low_52w": (info.get("fiftyTwoWeekLow") or 0) / divisor or None,
+        "high_52w": (info.get("fiftyTwoWeekHigh") or 0) / divisor or None,
         "family": family or info.get("fundFamily") or "",
         "fee": fee,
         "size": info.get("totalAssets") or info.get("netAssets"),
@@ -340,6 +355,11 @@ def fetch(symbol):
         "sector": info.get("sector") or "",
         "summary": info.get("longBusinessSummary") or "",
         "website": info.get("website") or "",
+        "exchange_name": info.get("fullExchangeName") or info.get("exchange") or "",
+        "pe": info.get("trailingPE"),
+        "market_cap_quote": info.get("marketCap"),
+        "low_52w": (info.get("fiftyTwoWeekLow") or 0) / divisor or None,
+        "high_52w": (info.get("fiftyTwoWeekHigh") or 0) / divisor or None,
         "price": float(closes.iloc[-1]) / divisor,
         "price_date": f"end of {closes.index[-1]:%b %Y}",
         "price_ccy": quote_ccy,
@@ -707,6 +727,38 @@ def research_links(d):
     return links
 
 
+def key_figures(d):
+    """Basic details: price and day change, size, valuation, yield, 52-week range, 1-year change."""
+    tiles = []
+    change = ""
+    if d.get("prev_close"):
+        pct = d["price"] / d["prev_close"] - 1
+        change = f'<span class="{"up" if pct >= 0 else "down"}">{pct:+.2%} today</span>'
+    tiles.append(("Price", price_text(d["price"], d["price_ccy"]), change or f"on {d['price_date']}"))
+    if d["kind"] == "stock":
+        tiles.append(("Market value", money(d.get("market_cap_quote"), d["price_ccy"]), d.get("exchange_name") or ""))
+        tiles.append(("P/E ratio", f"{d['pe']:.1f}" if d.get("pe") else "–", "price vs last 12 months' profit"))
+    else:
+        tiles.append(("Fund size", money(d.get("size"), d["price_ccy"]), d.get("family") or d.get("exchange_name") or ""))
+        tiles.append(("Fees", f"{d['fee']:.2%} a year" if d.get("fee") is not None else "–", "annual management cost"))
+    dy = d["dps_12m"] / d["price"] if d.get("dps_12m") and d["price"] else 0.0
+    tiles.append(("Dividend yield", f"{dy:.2%}", "last 12 months"))
+    if d.get("low_52w") and d.get("high_52w"):
+        lo, hi = to_display(d["low_52w"], d["price_ccy"])[0], to_display(d["high_52w"], d["price_ccy"])[0]
+        tiles.append(("52-week range", f"{lo:,.2f} – {hi:,.2f}", to_display(1, d["price_ccy"])[1]))
+    if d.get("ret_1y") is not None:
+        tiles.append(("1-year change", f'<span class="{"up" if d["ret_1y"] >= 0 else "down"}">{d["ret_1y"]:+.1%}</span>',
+                      "share price"))
+    st.markdown('<div class="stats">' + "".join(
+        f'<div class="stat"><div class="k">{k}</div><div class="v">{v}</div>'
+        f'<div class="s">{sub if sub.startswith("<span") else html.escape(sub)}</div></div>'
+        for k, v, sub in tiles) + "</div>", unsafe_allow_html=True)
+    shown, target = to_display(1, d["price_ccy"])
+    if target != d["price_ccy"]:
+        st.caption(f"Converted from {d['price_ccy']} at 1 {d['price_ccy']} = {shown:,.4f} {target} "
+                   f"(Yahoo Finance, refreshed hourly). Ratios are the same in any currency.")
+
+
 def research_buttons(d):
     st.markdown('<div class="links">' + "".join(
         f'<a href="{html.escape(url, quote=True)}" target="_blank" rel="noopener">{html.escape(label)} ↗</a>'
@@ -876,9 +928,28 @@ def source_detail(d):
     st.markdown("**Where these figures come from**\n\n" + "\n".join(lines))
 
 
+def to_display(x, ccy):
+    """Convert an amount into the chosen display currency. Returns (amount, currency)."""
+    target = st.session_state.get("display_ccy")
+    if x is None or not ccy or not target or ccy == target:
+        return x, ccy
+    try:
+        return x * fx_rate(ccy, target), target
+    except Exception:
+        return x, ccy   # no exchange rate available: keep the original currency
+
+
+def price_text(x, ccy):
+    x, ccy = to_display(x, ccy)
+    if x is None:
+        return "–"
+    return f"{x:,.2f} {ccy}" if abs(x) >= 1 else f"{x:,.3f} {ccy}"
+
+
 def money(x, ccy=""):
     if x is None or (isinstance(x, float) and math.isnan(x)):
         return "–"
+    x, ccy = to_display(x, ccy)
     for div, suffix in ((1e12, "T"), (1e9, "B"), (1e6, "M")):
         if abs(x) >= div:
             return f"{x/div:,.1f}{suffix} {ccy}".strip()
@@ -891,8 +962,9 @@ def get_data(symbol):
     except Exception as e:
         return None, f"Couldn't get figures for {symbol} right now ({e}). Check the code, or try again in a few minutes."
     try:
-        raw, when = quote(symbol)
+        raw, prev, when = quote(symbol)
         d["price"], d["price_date"] = raw / d["divisor"], when
+        d["prev_close"] = prev / d["divisor"] if prev else None
         if d["kind"] == "stock":
             d["mcap"] = raw * d["shares"] * d["conv"]
     except Exception:
@@ -959,6 +1031,19 @@ def brand_header():
 
 brand_header()
 
+_ccy_options = ["Original currency"] + DISPLAY_CURRENCIES
+_ccy_saved = st.query_params.get("ccy", "")
+if "ccy_choice" not in st.session_state:   # first visit: start from the currency saved in the link
+    st.session_state["ccy_choice"] = _ccy_saved if _ccy_saved in DISPLAY_CURRENCIES else "Original currency"
+_ccy = st.selectbox("Show prices in", _ccy_options, key="ccy_choice",
+                    help="Converts prices and values using Yahoo Finance exchange rates. Saved in this page's link.")
+st.session_state["display_ccy"] = _ccy if _ccy in DISPLAY_CURRENCIES else None
+if (_ccy if _ccy in DISPLAY_CURRENCIES else "") != _ccy_saved:
+    if _ccy in DISPLAY_CURRENCIES:
+        st.query_params["ccy"] = _ccy
+    elif "ccy" in st.query_params:
+        del st.query_params["ccy"]
+
 tab_check, tab_ideas, tab_mine, tab_how = st.tabs(["Check", "Find stocks", "My holdings", "How it works"])
 
 with tab_check:
@@ -983,12 +1068,14 @@ with tab_check:
                 with st.spinner("Checking what the fund holds…"):
                     s = screen_fund(d)
                 verdict_card(d, s)
+                key_figures(d)
                 source_line(d)
                 research_buttons(d)
                 fund_detail(d, s)
             else:
                 s = screen(d)
                 verdict_card(d, s)
+                key_figures(d)
                 source_line(d)
                 research_buttons(d)
 
@@ -1019,9 +1106,10 @@ with tab_check:
                     by = f" ({s['checked_by']})" if s["business"] != "Review" else ""
                     st.write(f"Business check: **{s['business']}{by}**. {s['why'] if s['business'] != 'Fail' else ''}")
                     st.write(f"Industry: {d['industry'] or 'unknown'} · Reported in {d['fin_ccy']}")
-                    st.write(f"Debt {money(d['debt'])} · Cash & investments {money(d['cash'])} · "
-                             f"Money owed {money(d['receivables'])} · 2-year average value {money(d['avg_mcap'])} · "
-                             f"Total assets {money(d['assets'])}")
+                    fc = d["fin_ccy"]
+                    st.write(f"Debt {money(d['debt'], fc)} · Cash & investments {money(d['cash'], fc)} · "
+                             f"Money owed {money(d['receivables'], fc)} · 2-year average value {money(d['avg_mcap'], fc)} · "
+                             f"Total assets {money(d['assets'], fc)}")
                     st.markdown("**How other standards see it**")
                     standards_table(s)
                     source_detail(d)
@@ -1174,8 +1262,9 @@ with tab_mine:
         st.write(f"Yearly review: **{NEXT_REVIEW:%d %B %Y}** (last day of Sha'ban, about {days} days away).")
         totals = {}
         for r in rows:
-            t = totals.setdefault(r["d"]["price_ccy"], {"value": 0, "zakat": 0, "purge": 0})
-            t["value"] += r["value"]; t["zakat"] += r["zakat"]; t["purge"] += r["purge"]
+            rate, ccy = to_display(1, r["d"]["price_ccy"])
+            t = totals.setdefault(ccy, {"value": 0, "zakat": 0, "purge": 0})
+            t["value"] += r["value"] * rate; t["zakat"] += r["zakat"] * rate; t["purge"] += r["purge"] * rate
         for ccy, t in totals.items():
             st.write(f"**{ccy}**: holdings {money(t['value'], ccy)} · zakat {money(t['zakat'], ccy)} · "
                      f"dividends to give to charity {money(t['purge'], ccy)}")
@@ -1235,6 +1324,11 @@ recommendations. The list is worked out once a day, so the first search of the d
 
 The app counts all of a company's cash, because Yahoo Finance doesn't separate interest-earning cash.
 The standards only count interest-earning cash, so cash-rich companies can look worse here than they really are.
+
+**Prices and currency.** Each result shows the current price and today's change, market value (or fund size
+and fees for ETFs), P/E, dividend yield, 52-week range and 1-year change. Use **Show prices in** at the top to
+see prices, values, zakat and dividend cleaning in AUD, USD, SGD, MYR and other currencies, converted at Yahoo
+Finance exchange rates. Your choice is saved in the page link. The Shariah ratios are the same in any currency.
 
 **Where the figures come from.** Everything comes from Yahoo Finance. Share prices refresh every
 15 minutes (the exchange may delay them about 20 minutes). Company figures refresh every 6 hours and use the
