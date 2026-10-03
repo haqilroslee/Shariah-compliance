@@ -39,7 +39,8 @@ IDEAS_CANDIDATES = 100    # how many of the largest companies to screen (more = 
 IDEAS_SHOW = 50
 IDEAS_SKIP_SECTORS = ["Financial Services"]   # mostly banks and insurers, so not worth screening
 NEXT_REVIEW = date(2027, 2, 7)   # last day of Sha'ban 1448 (approx, confirm by moon sighting)
-REVIEWER = "Haqil"        # who checks business activities
+MANUAL_CHECK_TIP = ("Before buying, look at the company's latest annual report: check what it earns its revenue "
+                    "from and whether any of it is non-permissible, or ask a scholar you trust.")
 
 # Automatic business check (sector_review.csv always overrides it)
 # Industries that fail automatically
@@ -402,7 +403,7 @@ def screen(d):
         if np_pct is None:
             reasons.append("Its revenue figures are missing, so interest income can't be checked.")
         if reasons:
-            business, why = "Review", f"Needs a manual check. {' '.join(reasons)} Ask {REVIEWER}."
+            business, why = "Review", f"Needs a manual check. {' '.join(reasons)} {MANUAL_CHECK_TIP}"
         else:
             business, why = "Pass", (f"Passed the automatic check: its industry ({d['industry']}) isn't a risky one, "
                                      f"its description mentions nothing non-permissible, and interest income is "
@@ -969,7 +970,8 @@ The app checks this automatically. It **fails** a company in an excluded industr
 is 5% of revenue or more. It **passes** a company only when its industry isn't a risky one, its company
 description mentions nothing non-permissible, and its interest income is under 5%. Anything else, such as
 supermarkets that sell alcohol, restaurants, hotels or defence companies, shows **needs a manual check**
-until {REVIEWER} records a decision. {REVIEWER}'s decision always overrides the automatic check.
+until it has been checked by hand and the decision recorded in the app's review list. A recorded decision
+always overrides the automatic check.
 The automatic check can't see small amounts of non-permissible revenue that a company doesn't describe.
 
 **2. The company's finances.** Three figures are compared with the company's average value over 2 years:
