@@ -132,10 +132,12 @@ html, body, .stApp, .stApp p, .stApp li, .stApp input, .stApp button, .stApp lab
 .bar .tick { position: absolute; top: -4px; bottom: -4px; width: 2px; background: var(--wf-muted); }
 .row { display: flex; justify-content: space-between; font-size: 1rem; }
 .src { font-size: 0.85rem; opacity: 0.8; margin: -0.6rem 0 1rem; line-height: 1.5; }
-.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 0.5rem; margin: 0 0 0.6rem; }
-.stat { background: var(--wf-surface); border: 1px solid var(--wf-line); border-radius: 8px; padding: 0.55rem 0.8rem; }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(150px, 100%), 1fr)); gap: 0.5rem; margin: 0 0 0.6rem; }
+.stat { background: var(--wf-surface); border: 1px solid var(--wf-line); border-radius: 8px; padding: 0.55rem 0.8rem;
+        min-width: 0; overflow-wrap: anywhere; }
 .stat .k { font-size: 0.78rem; color: var(--wf-muted); }
-.stat .v { font-size: 1.15rem; font-weight: 700; margin-top: 0.1rem; white-space: nowrap; }
+.stat .v { font-size: 1.15rem; font-weight: 700; margin-top: 0.1rem; line-height: 1.3; }
+.stat .v .nw { white-space: nowrap; }
 .stat .s { font-size: 0.75rem; color: var(--wf-muted); margin-top: 0.1rem; }
 .up { color: var(--wf-good); font-weight: 600; }
 .down { color: var(--wf-bad); font-weight: 600; }
@@ -734,7 +736,8 @@ def key_figures(d):
     if d.get("prev_close"):
         pct = d["price"] / d["prev_close"] - 1
         change = f'<span class="{"up" if pct >= 0 else "down"}">{pct:+.2%} today</span>'
-    tiles.append(("Price", price_text(d["price"], d["price_ccy"]), change or f"on {d['price_date']}"))
+    p, pc = to_display(d["price"], d["price_ccy"])
+    tiles.append(("Price", f'<span class="nw">{num_text(p)}</span> {pc}', change or f"on {d['price_date']}"))
     if d["kind"] == "stock":
         tiles.append(("Market value", money(d.get("market_cap_quote"), d["price_ccy"]), d.get("exchange_name") or ""))
         tiles.append(("P/E ratio", f"{d['pe']:.1f}" if d.get("pe") else "–", "price vs last 12 months' profit"))
@@ -745,7 +748,8 @@ def key_figures(d):
     tiles.append(("Dividend yield", f"{dy:.2%}", "last 12 months"))
     if d.get("low_52w") and d.get("high_52w"):
         lo, hi = to_display(d["low_52w"], d["price_ccy"])[0], to_display(d["high_52w"], d["price_ccy"])[0]
-        tiles.append(("52-week range", f"{lo:,.2f} – {hi:,.2f}", to_display(1, d["price_ccy"])[1]))
+        tiles.append(("52-week range", f'<span class="nw">{num_text(lo)} –</span> <span class="nw">{num_text(hi)}</span>',
+                      to_display(1, d["price_ccy"])[1]))
     if d.get("ret_1y") is not None:
         tiles.append(("1-year change", f'<span class="{"up" if d["ret_1y"] >= 0 else "down"}">{d["ret_1y"]:+.1%}</span>',
                       "share price"))
@@ -939,11 +943,14 @@ def to_display(x, ccy):
         return x, ccy   # no exchange rate available: keep the original currency
 
 
+def num_text(x):
+    """A price-sized number: no decimals from 1,000 up, 3 below 1."""
+    return f"{x:,.0f}" if abs(x) >= 1000 else f"{x:,.2f}" if abs(x) >= 1 else f"{x:,.3f}"
+
+
 def price_text(x, ccy):
     x, ccy = to_display(x, ccy)
-    if x is None:
-        return "–"
-    return f"{x:,.2f} {ccy}" if abs(x) >= 1 else f"{x:,.3f} {ccy}"
+    return "–" if x is None else f"{num_text(x)} {ccy}"
 
 
 def money(x, ccy=""):
