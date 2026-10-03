@@ -5,6 +5,7 @@ Screening rules follow the family methodology (tiers at 30% / 33%, 5% revenue li
 """
 import html
 import math
+import re
 from datetime import date, datetime
 
 import pandas as pd
@@ -31,13 +32,22 @@ FUND_MAX_BONDS = 0.01     # conventional bonds pay interest; more than this fail
 NEXT_REVIEW = date(2027, 2, 7)   # last day of Sha'ban 1448 (approx, confirm by moon sighting)
 REVIEWER = "Haqil"        # who checks business activities
 
-# Industries treated as excluded unless the family review says otherwise
+# Automatic business check (sector_review.csv always overrides it)
+# Industries that fail automatically
 EXCLUDED_KEYWORDS = ["bank", "insurance", "credit services", "mortgage", "capital markets",
                      "financial conglomerate", "asset management", "gambling", "casino",
                      "brewer", "winer", "distiller", "tobacco"]
-# Industries that need a closer look
-REVIEW_KEYWORDS = ["aerospace & defense", "restaurant", "lodging", "entertainment",
-                   "beverages", "packaged foods", "resorts", "leisure"]
+# Industries that often mix permissible and non-permissible sales, so always need a manual review
+REVIEW_KEYWORDS = ["aerospace & defense", "restaurant", "lodging", "entertainment", "resorts", "leisure",
+                   "packaged foods", "farm products", "food distribution", "grocery", "discount stores",
+                   "department stores", "reit", "conglomerates", "shell companies", "broadcasting",
+                   "travel services", "electronic gaming"]
+# Words in the company's description that need a manual review (whole words, any case; * = any ending)
+DESCRIPTION_FLAGS = ["alcohol*", "liquor*", "beer*", "wine*", "spirits", "brew*", "distill*",
+                     "tobacco", "cigar*", "vap*", "e-cigarette*", "gambling", "casino*", "wager*", "betting",
+                     "lotter*", "poker", "pork", "swine", "ham", "bacon", "adult entertainment", "pornograph*",
+                     "nightclub*", "lending", "loans", "mortgage*", "consumer finance", "insurance", "banking",
+                     "weapon*", "firearm*", "ammunition", "munitions"]
 
 MINOR_UNITS = {"GBp": ("GBP", 100), "GBX": ("GBP", 100), "ZAc": ("ZAR", 100), "ILA": ("ILS", 100)}
 
@@ -213,6 +223,7 @@ def fetch(symbol):
         "exchange": info.get("exchange", ""),
         "industry": info.get("industry") or "",
         "sector": info.get("sector") or "",
+        "summary": info.get("longBusinessSummary") or "",
         "price": float(closes.iloc[-1]) / divisor,
         "price_ccy": quote_ccy,
         "fin_ccy": fin_ccy,
@@ -287,6 +298,15 @@ def standards(d, failed_business):
     return results
 
 
+FLAG_RE = re.compile(r"\b(" + "|".join(re.escape(w).replace(r"\*", r"\w*") for w in DESCRIPTION_FLAGS) + r")\b",
+                     re.IGNORECASE)
+
+
+def description_flags(text):
+    """Distinct flagged words found in a company description, in the order they appear."""
+    return list(dict.fromkeys(m.lower() for m in FLAG_RE.findall(text or "")))
+
+
 def screen(d):
     review = load_review().get(d["symbol"].upper())
     industry = f'{d["industry"]} {d["sector"]}'.lower()
@@ -300,17 +320,35 @@ def screen(d):
         if review is not None and review["non_permissible_revenue_pct"].strip():
             np_source += "; the family figure in sector_review.csv couldn't be read"
 
+    checked_by = "family" if review is not None and review["excluded"].strip().lower() in ("yes", "no") else "automatic"
     if review is not None and review["excluded"].strip().lower() == "yes":
         business, why = "Fail", "The family review marked this business as excluded."
     elif review is None and any(k in industry for k in EXCLUDED_KEYWORDS):
         business, why = "Fail", f"Its industry ({d['industry']}) is on the excluded list."
     elif np_pct is not None and np_pct >= REVENUE_LIMIT:
         business, why = "Fail", f"{np_pct:.1%} of revenue comes from non-permissible sources (limit is under 5%)."
-    elif review is not None and review["excluded"].strip().lower() == "no":
+    elif checked_by == "family":
         business, why = "Pass", "Business activities checked by the family."
     else:
-        extra = " Its industry usually needs a closer look." if any(k in industry for k in REVIEW_KEYWORDS) else ""
-        business, why = "Review", f"Business activities haven't been checked yet. Ask {REVIEWER}.{extra}"
+        # Automatic check: pass only when nothing at all needs a closer look
+        reasons = []
+        if not d["industry"]:
+            reasons.append("Yahoo Finance doesn't say what industry it is in.")
+        elif any(k in industry for k in REVIEW_KEYWORDS):
+            reasons.append(f"Its industry ({d['industry']}) often includes non-permissible sales.")
+        flags = description_flags(d.get("summary"))
+        if flags:
+            reasons.append(f"Its company description mentions: {', '.join(flags)}.")
+        elif not d.get("summary"):
+            reasons.append("Yahoo Finance has no description of what it does.")
+        if np_pct is None:
+            reasons.append("Its revenue figures are missing, so interest income can't be checked.")
+        if reasons:
+            business, why = "Review", f"Needs a manual check. {' '.join(reasons)} Ask {REVIEWER}."
+        else:
+            business, why = "Pass", (f"Passed the automatic check: its industry ({d['industry']}) isn't a risky one, "
+                                     f"its description mentions nothing non-permissible, and interest income is "
+                                     f"{np_pct:.1%} of revenue.")
 
     r = {
         "Debt": ratio(d["debt"], d["avg_mcap"]),
@@ -331,7 +369,7 @@ def screen(d):
         tier = "Tier 1"
 
     return {
-        "tier": tier, "business": business, "why": why, "ratios": r, "highest": highest,
+        "tier": tier, "business": business, "checked_by": checked_by, "why": why, "ratios": r, "highest": highest,
         "purge_pct": np_pct or 0.0, "purge_source": np_source,
         "standards": standards(d, business == "Fail"),
     }
@@ -360,7 +398,7 @@ def screen_fund(f):
             rows.append({"Holding": name, "Code": sym, "Weight": weight, "Result": "Couldn't check", "tier": "Incomplete"})
             continue
         hs = screen(d)
-        result = TIER_STYLE[hs["tier"]][0] + (" (business not checked)" if hs["business"] == "Review" else "")
+        result = TIER_STYLE[hs["tier"]][0] + (" (needs manual check)" if hs["business"] == "Review" else "")
         rows.append({"Holding": d["name"], "Code": d["symbol"], "Weight": weight, "Result": result, "tier": hs["tier"]})
         if hs["tier"] == "Incomplete":
             continue
@@ -613,7 +651,8 @@ with tab_check:
                          f"({s['purge_source'] or 'no revenue data'}).")
 
                 with st.expander("More detail"):
-                    st.write(f"Business check: **{s['business']}**. {s['why'] if s['business'] != 'Fail' else ''}")
+                    by = f" ({s['checked_by']})" if s["business"] != "Review" else ""
+                    st.write(f"Business check: **{s['business']}{by}**. {s['why'] if s['business'] != 'Fail' else ''}")
                     st.write(f"Industry: {d['industry'] or 'unknown'} · Figures as of {d['as_of']} · Reported in {d['fin_ccy']}")
                     st.write(f"Debt {money(d['debt'])} · Cash & investments {money(d['cash'])} · "
                              f"Money owed {money(d['receivables'])} · 2-year average value {money(d['avg_mcap'])} · "
@@ -676,7 +715,7 @@ with tab_mine:
         for r in rows:
             label, bg, fg, action = TIER_STYLE[r["s"]["tier"]]
             action = r["s"].get("action") or action
-            flag = " · business not checked yet" if r["s"]["business"] == "Review" else ""
+            flag = " · business needs a manual check" if r["s"]["business"] == "Review" else ""
             st.markdown(f"""
             <div class="verdict" style="background:{bg};color:{fg};padding:0.9rem 1.1rem;margin:0.5rem 0">
               <div style="font-size:1.25rem;font-weight:700">{html.escape(r['d']['name'])}: {label}</div>
@@ -703,7 +742,14 @@ with tab_how:
     st.markdown(f"""
 **1. What the business does.** Companies in conventional banking or insurance, gambling, alcohol,
 pork or non-halal food, tobacco, adult entertainment or aggressive weapons are excluded.
-Less than 5% of revenue may come from non-permissible sources. {REVIEWER} checks this for each company.
+Less than 5% of revenue may come from non-permissible sources.
+
+The app checks this automatically. It **fails** a company in an excluded industry, or whose interest income
+is 5% of revenue or more. It **passes** a company only when its industry isn't a risky one, its company
+description mentions nothing non-permissible, and its interest income is under 5%. Anything else, such as
+supermarkets that sell alcohol, restaurants, hotels or defence companies, shows **needs a manual check**
+until {REVIEWER} records a decision. {REVIEWER}'s decision always overrides the automatic check.
+The automatic check can't see small amounts of non-permissible revenue that a company doesn't describe.
 
 **2. The company's finances.** Three figures are compared with the company's average value over 2 years:
 its interest-bearing debt, its cash and interest-earning investments, and the money owed to it.

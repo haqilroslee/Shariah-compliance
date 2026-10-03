@@ -20,8 +20,16 @@ Takes about 15 minutes, once. Do this on a computer.
 If his holdings change, update them in the app and send him the new link.
 
 ## Checking a company's business activities
-The app can't judge business activities on its own. Until you check a company it shows
-"Business activities haven't been checked yet". To record your check:
+The app checks business activities automatically:
+- **Fail:** the industry is excluded (banks, insurance, gambling, alcohol, tobacco and so on), or interest
+  income is 5% of revenue or more.
+- **Needs a manual check:** the industry often mixes permissible and non-permissible sales (supermarkets,
+  restaurants, hotels, defence, REITs, packaged food and so on), the company description mentions something
+  like alcohol, gambling, pork or lending, or figures are missing.
+- **Pass:** none of the above.
+
+The lists are at the top of `app.py` (`EXCLUDED_KEYWORDS`, `REVIEW_KEYWORDS`, `DESCRIPTION_FLAGS`).
+Your own decision in `sector_review.csv` always overrides the automatic check. To record it:
 1. On GitHub, open `sector_review.csv` → pencil icon (Edit).
 2. Add one line per company, for example:
    `WOW.AX,No,1.2,Checked 2026 annual report`
