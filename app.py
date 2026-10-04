@@ -14,6 +14,7 @@ import re
 from urllib.parse import quote_plus
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
@@ -46,6 +47,7 @@ FUND_MAX_BONDS = 0.01     # conventional bonds pay interest; more than this fail
 ETF_FULL_TARGET = 0.95
 ETF_FULL_MAX = 150
 HOLDINGS_DIR = "etf_holdings"
+APP_TZ = ZoneInfo("Australia/Sydney")   # times shown in the app (e.g. when a check was done)
 ETF_DEPTHS = {"quick": "Quick: top holdings from Yahoo",
               "full": "Full: every holding from the fund provider (slower)"}
 SPDR_HOLDINGS_URL = "https://www.ssga.com/us/en/intermediary/etfs/library-content/products/fund-data/etfs/us/holdings-daily-us-en-{}.xlsx"
@@ -157,6 +159,18 @@ html, body, .stApp, .stApp p, .stApp li, .stApp input, .stApp button, .stApp lab
 .stat .s { font-size: 0.75rem; color: var(--wf-muted); margin-top: 0.1rem; }
 .up { color: var(--wf-good); font-weight: 600; }
 .down { color: var(--wf-bad); font-weight: 600; }
+.wsum { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0.4rem 0 0.8rem; }
+.wcard { background: var(--wf-surface); border: 1px solid var(--wf-line); border-radius: 8px; padding: 0.75rem 0.9rem;
+         margin: 0.8rem 0 0.4rem; }
+.wtop { display: flex; justify-content: space-between; align-items: flex-start; gap: 0.4rem 0.6rem; flex-wrap: wrap; }
+.wtop .pill { white-space: normal; text-align: left; }
+/* button pairs (Open / Remove, Open / Watch) stay side by side on phones */
+[class*="st-key-pair_"] [data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; gap: 0.5rem; }
+[class*="st-key-pair_"] [data-testid="stColumn"] { min-width: 0 !important; width: auto !important; flex: 1 1 0 !important; }
+.wtop small { color: var(--wf-muted); margin-left: 0.2rem; }
+.wprice { font-size: 1.05rem; font-weight: 700; margin: 0.25rem 0 0.2rem; }
+.wsub { font-size: 0.82rem; color: var(--wf-muted); line-height: 1.45; }
+.wsub b { color: var(--wf-ink); font-weight: 600; }
 .links { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: -0.4rem 0 1.1rem; }
 .links a { display: inline-block; padding: 0.3rem 0.75rem; border: 1px solid var(--wf-line); border-radius: 999px;
            background: var(--wf-surface); color: var(--wf-primary) !important; font-size: 0.85rem; font-weight: 600;
@@ -294,6 +308,7 @@ def fetch_fund(t, info, symbol):
         pass
     return {
         "kind": "fund",
+        "checked_at": datetime.now(APP_TZ).strftime("%d %b %Y, %H:%M %Z"),
         "website": info.get("website") or "",
         "exchange_name": info.get("fullExchangeName") or info.get("exchange") or "",
         "pe": info.get("trailingPE"),
@@ -397,6 +412,7 @@ def fetch(symbol):
         "ret_1y": float(closes.iloc[-1] / closes.iloc[-13] - 1) if len(closes) >= 13 else None,
         "mcap": float(closes.iloc[-1]) * shares * conv,
         "as_of": bs.date.strftime("%d %b %Y"),
+        "checked_at": datetime.now(APP_TZ).strftime("%d %b %Y, %H:%M %Z"),
         "bs_kind": bs_kind,
         "bs_label": (f"{bs.date:%d %b %Y} (FY{bs.date.year} annual report)" if bs_kind == "annual"
                      else f"{bs.date:%d %b %Y} (latest half-year or quarterly report)"),
@@ -1239,7 +1255,53 @@ if (_ccy if _ccy in DISPLAY_CURRENCIES else "") != _ccy_saved:
     elif "ccy" in st.query_params:
         del st.query_params["ccy"]
 
-tab_check, tab_ideas, tab_mine, tab_how = st.tabs(["Check", "Find stocks", "My holdings", "How it works"])
+tab_check, tab_ideas, tab_watch, tab_mine, tab_how = st.tabs(["Check", "Find", "Watchlist", "Holdings", "How it works"])
+
+# ----------------------------------------------------------------------------- watchlist (kept in the link as ?w=)
+def watchlist():
+    if "watchlist" not in st.session_state:
+        st.session_state["watchlist"] = [c for c in st.query_params.get("w", "").split(",") if c]
+    return st.session_state["watchlist"]
+
+
+def save_watchlist():
+    wl = watchlist()
+    if wl:
+        st.query_params["w"] = ",".join(wl)
+    elif "w" in st.query_params:
+        del st.query_params["w"]
+
+
+def toggle_watch(symbol):
+    wl = watchlist()
+    if symbol in wl:
+        wl.remove(symbol)
+    else:
+        wl.append(symbol)
+    save_watchlist()
+
+
+def watch_button(symbol, key, short=False):
+    on = symbol in watchlist()
+    label = ("★ Watching" if on else "☆ Watch") if short else \
+            ("★ On your watchlist · Remove" if on else "☆ Add to watchlist")
+    st.button(label, key=f"watch_{key}_{symbol}", on_click=toggle_watch, args=(symbol,), width="stretch" if short else "content",
+              help="Remove from your watchlist" if on else "Add to your watchlist for a quick overview")
+
+
+def based_on(d, s):
+    """What a result rests on, in one or two short lines: reports used and when WattleFolio checked."""
+    if d["kind"] == "fund":
+        src = s.get("source", "Yahoo Finance")
+        dated = f", as of {s['as_of']}" if s.get("as_of") else ""
+        used = f"Holdings from {src}{dated}"
+        old = False
+    else:
+        used = f"{d['inc_label'].split(' (')[0]} · balance sheet {d['as_of']}"
+        old = d.get("bs_days", 0) > STALE_DAYS or d.get("inc_days", 0) > STALE_DAYS
+    checked = f"Checked by WattleFolio {d.get('checked_at', '')} · price {d['price_date']}"
+    return used, checked, old
+
 
 # ----------------------------------------------------------------------------- opening a check from another list
 def nav_stack(place):
@@ -1305,6 +1367,7 @@ def show_result(symbol, place, key):
                         else "Checking what the fund holds…"):
             s = screen_fund(d)
         verdict_card(d, s)
+        watch_button(d["symbol"], key)
         key_figures(d)
         source_line(d)
         research_buttons(d)
@@ -1312,6 +1375,7 @@ def show_result(symbol, place, key):
     else:
         s = screen(d)
         verdict_card(d, s)
+        watch_button(d["symbol"], key)
         key_figures(d)
         source_line(d)
         research_buttons(d)
@@ -1440,8 +1504,12 @@ def ideas_tab():
                            f"Debt {r['debt']:.0%}" if r["debt"] is not None else None]
                 with st.expander(f"{i}. {d['name']} ({d['symbol']}) · {label}",
                                  expanded=st.session_state.get("last_opened_ideas") == d["symbol"]):
-                    st.button("Open full check →", key=f"open_ideas_{kind}_{d['symbol']}", type="primary",
-                              on_click=open_check, args=("ideas", d["symbol"], d["name"]))
+                    with st.container(key=f"pair_ideas_{kind}_{d['symbol']}"):
+                        b1, b2 = st.columns(2)
+                        b1.button("Open full check →", key=f"open_ideas_{kind}_{d['symbol']}", type="primary",
+                                  on_click=open_check, args=("ideas", d["symbol"], d["name"]), width="stretch")
+                        with b2:
+                            watch_button(d["symbol"], f"ideas_{kind}", short=True)
                     st.write(" · ".join(f for f in figures if f))
                     if etf_mode:
                         st.write(s["why"])
@@ -1459,8 +1527,80 @@ def ideas_tab():
 
 
 with tab_ideas:
-    if not navigated("ideas", "Find stocks"):
+    if not navigated("ideas", "Find"):
         ideas_tab()
+
+def add_typed_code():
+    code = (st.session_state.get("watch_add") or "").strip().upper()
+    if code and code not in watchlist():
+        watchlist().append(code)
+        save_watchlist()
+    st.session_state["watch_add"] = ""
+
+
+def watchlist_tab():
+    st.write("A quick overview of the shares and ETFs you're keeping an eye on. Your watchlist is saved in this "
+             "page's link, so bookmark it or add it to your home screen.")
+    c1, c2 = st.columns([3, 1], vertical_alignment="bottom")
+    c1.text_input("Add a share or ETF code", placeholder="e.g. BHP.AX, AAPL, SPY", key="watch_add",
+                  on_change=add_typed_code)
+    c2.button("Add", on_click=add_typed_code, width="stretch")
+    wl = list(watchlist())
+    if not wl:
+        st.info("Your watchlist is empty. Add a code above, or tap ☆ Add to watchlist on any result in Check or Find.")
+        return
+
+    ctx = get_script_run_ctx()
+
+    def check(sym):
+        d, err = get_data(sym)
+        return sym, d, err, (evaluate(d) if d else None)
+
+    with st.spinner("Checking your watchlist…"):
+        with ThreadPoolExecutor(max_workers=6, initializer=lambda: add_script_run_ctx(None, ctx)) as pool:
+            items = list(pool.map(check, wl))
+
+    counts = {}
+    for _, d, _, s in items:
+        label = "Couldn't check" if s is None else ("Islamic fund" if s.get("islamic") else TIER_STYLE[s["tier"]][0])
+        counts[label] = counts.get(label, 0) + 1
+    order = ["Compliant", "Islamic fund", "On watch", "Not compliant", "Can't tell yet", "Couldn't check"]
+    tier_of = {"Compliant": "Tier 1", "Islamic fund": "Tier 1", "On watch": "Tier 2", "Not compliant": "Tier 3"}
+    st.markdown('<div class="wsum">' + "".join(pill(f"{counts[k]} {k.lower()}", tier_of.get(k, "Incomplete"))
+                                               for k in order if k in counts) + "</div>", unsafe_allow_html=True)
+
+    for sym, d, err, s in items:
+        if d is None:
+            badge = pill("Couldn't check", "Incomplete")
+            st.markdown(f'<div class="wcard"><div class="wtop"><b>{html.escape(sym)}</b>{badge}</div>'
+                        f'<div class="wsub">{html.escape(err or "")}</div></div>', unsafe_allow_html=True)
+            st.button("Remove", key=f"wl_rm_{sym}", on_click=toggle_watch, args=(sym,))
+            continue
+        status = "Islamic fund" if s.get("islamic") else TIER_STYLE[s["tier"]][0]
+        if s["business"] == "Review" and not s.get("islamic"):
+            status += " · needs manual check"
+        change = ""
+        if d.get("prev_close"):
+            pct = d["price"] / d["prev_close"] - 1
+            change = f' <span class="{"up" if pct >= 0 else "down"}">{pct:+.2%}</span>'
+        used, checked, old = based_on(d, s)
+        warn = '<div class="wsub down">Some figures are over a year old</div>' if old else ""
+        st.markdown(
+            f'<div class="wcard"><div class="wtop"><span><b>{html.escape(d["name"])}</b> '
+            f'<small>{html.escape(d["symbol"])}</small></span>{pill(status, s["tier"])}</div>'
+            f'<div class="wprice">{price_text(d["price"], d["price_ccy"])}{change}</div>'
+            f'<div class="wsub"><b>Based on:</b> {html.escape(used)}</div>'
+            f'<div class="wsub">{html.escape(checked)}</div>{warn}</div>', unsafe_allow_html=True)
+        with st.container(key=f"pair_wl_{sym}"):
+            b1, b2 = st.columns(2)
+            b1.button("Open full check →", key=f"wl_open_{sym}", on_click=open_check, args=("watch", sym, d["name"]),
+                      width="stretch")
+            b2.button("Remove", key=f"wl_rm_{sym}", on_click=toggle_watch, args=(sym,), width="stretch")
+
+
+with tab_watch:
+    if not navigated("watch", "your watchlist"):
+        watchlist_tab()
 
 with tab_mine:
     st.write("Your holdings are saved in this page's link. After making changes, bookmark the page "
@@ -1578,17 +1718,22 @@ checked, or isn't listed by Yahoo.
 
 **Quick or full ETF check.** Each ETF page lets you choose. **Quick** (the default) checks the top 10 holdings
 Yahoo Finance lists: instant, and often enough to see whether a fund holds banks. **Full** checks the fund
-provider's complete list. The choice is remembered in the page link and also applies to My holdings.
+provider's complete list. The choice is remembered in the page link and also applies to the Holdings tab.
 
 **Full ETF holdings.** Yahoo Finance only lists an ETF's top 10 holdings. With the full check, when the fund
 provider's full holdings file is available (uploaded on the ETF's page, saved in the app and refreshed each night, or downloaded
 automatically for SPDR and BetaShares ETFs), the app checks the largest holdings until 95% of the fund is covered, up to 150 holdings. Cash and futures
 are shown separately. An ETF checked this way can be compliant if everything checked passes.
 
-**7. Find stocks.** Lists the largest companies in a market that pass the WattleFolio rules, sorted by the
+**7. Find.** Lists the largest companies in a market that pass the WattleFolio rules, sorted by the
 figure you choose. Banks and insurers are left out before screening. Tick **ETFs only** to look through the
 largest ETFs instead (plus Islamic ETFs found by name), sorted by size, dividend yield, 1-year change or fees. These are ideas to research, not
 recommendations. The list is worked out once a day, so the first search of the day takes a few minutes.
+
+**8. Watchlist.** Add any share or ETF with **☆ Add to watchlist** on its result, **☆ Watch** in Find, or by
+typing its code in the Watchlist tab. Each one shows whether it's compliant, its price, and what the result is
+based on: the annual report and balance sheet dates (or where an ETF's holdings came from) and when WattleFolio
+last checked it. Your watchlist is saved in the page link.
 
 **How the WattleFolio rules compare with the main standards.** Our rules are closest to Dow Jones Islamic
 (same 2-year average), but stricter: on-watch starts at 30%. Each stock's
