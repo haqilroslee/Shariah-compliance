@@ -17,6 +17,7 @@ from datetime import date, datetime
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 import yfinance as yf
 from holdings import parse_holdings_file, yahoo_candidates
 from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
@@ -971,7 +972,7 @@ def mix_bar(s):
     st.markdown(f'<div class="mix"><div class="mixbar">{bar}</div>{"".join(legend)}</div>', unsafe_allow_html=True)
 
 
-def holdings_upload(d, s):
+def holdings_upload(d, s, key="check"):
     """Upload a provider's full holdings file for this ETF (kept for this visit)."""
     sym = d["symbol"].upper()
     uploaded = st.session_state.setdefault("uploaded_holdings", {})
@@ -984,7 +985,7 @@ def holdings_upload(d, s):
         st.caption(f"An uploaded file is used for this visit only. To keep it for everyone, add it to the "
                    f"`{HOLDINGS_DIR}` folder on GitHub named after the fund, e.g. `{sym}.csv` or `{sym}.xlsx`.")
         gen = st.session_state.get("holdings_upload_gen", 0)   # bumped to empty the upload box
-        f = st.file_uploader("Holdings file (CSV or Excel)", type=["csv", "xlsx", "xls"], key=f"holdings_file_{sym}_{gen}")
+        f = st.file_uploader("Holdings file (CSV or Excel)", type=["csv", "xlsx", "xls"], key=f"holdings_file_{key}_{sym}_{gen}")
         if f is not None and uploaded.get(sym, {}).get("id") != (f.name, f.size):
             try:
                 parsed = parse_holdings_file(f.getvalue(), f.name)
@@ -993,13 +994,13 @@ def holdings_upload(d, s):
             else:
                 uploaded[sym] = {"id": (f.name, f.size), "file": f.name, **parsed}
                 st.rerun()
-        if sym in uploaded and st.button("Stop using the uploaded file", key=f"holdings_clear_{sym}"):
+        if sym in uploaded and st.button("Stop using the uploaded file", key=f"holdings_clear_{key}_{sym}"):
             uploaded.pop(sym, None)
             st.session_state["holdings_upload_gen"] = gen + 1
             st.rerun()
 
 
-def fund_detail(d, s):
+def fund_detail(d, s, place="check", key="check"):
     st.subheader("Why")
     st.write(s["why"])
     if s["rows"]:
@@ -1026,7 +1027,14 @@ def fund_detail(d, s):
         if len(s["rows"]) > 15:
             with st.expander(f"Show all {len(s['rows'])} holdings checked"):
                 st.markdown(holding_rows(s["rows"][15:]), unsafe_allow_html=True)
-    holdings_upload(d, s)
+        names = {r["Code"]: r["Holding"] for r in s["rows"] if r["Result"] != "Couldn't check"}
+        if names:
+            c1, c2 = st.columns([3, 1], vertical_alignment="bottom")
+            pick = c1.selectbox("Check one of these holdings", list(names), index=None, key=f"pick_{key}",
+                                format_func=lambda c: f"{names[c]} ({c})", placeholder="Choose a holding")
+            c2.button("Open →", key=f"pick_open_{key}", disabled=pick is None, on_click=open_check,
+                      args=(place, pick, names[pick]) if pick else (place, "", ""))
+    holdings_upload(d, s, key)
 
     st.subheader("Cleaning dividends")
     if s["checked"]:
@@ -1208,6 +1216,13 @@ def brand_header():
 
 brand_header()
 
+KEPT_CONTROLS = ["check_query", "check_pick", "ideas_etf", "ideas_market", "ideas_sort_stock", "ideas_sort_etf",
+                 "ideas_watch_stock", "ideas_watch_etf", "ideas_manual_stock", "ideas_manual_etf"]
+for _k in KEPT_CONTROLS:   # re-saving a control's value stops Streamlit discarding it while it isn't shown
+    if _k in st.session_state:
+        st.session_state[_k] = st.session_state[_k]
+st.session_state.setdefault("ideas_manual_stock", True)
+
 if "etf_depth" not in st.session_state:   # quick or full ETF check, remembered in the link as ?etf=full
     st.session_state["etf_depth"] = "full" if st.query_params.get("etf") == "full" else "quick"
 
@@ -1226,104 +1241,156 @@ if (_ccy if _ccy in DISPLAY_CURRENCIES else "") != _ccy_saved:
 
 tab_check, tab_ideas, tab_mine, tab_how = st.tabs(["Check", "Find stocks", "My holdings", "How it works"])
 
-with tab_check:
-    query = st.text_input("Company, ETF or share code", placeholder="e.g. Woolworths, BHP.AX, Apple, SPUS")
+# ----------------------------------------------------------------------------- opening a check from another list
+def nav_stack(place):
+    """What has been opened from a tab, newest last: [(symbol, name)]."""
+    return st.session_state.setdefault(f"nav_{place}", [])
+
+
+def open_check(place, symbol, name):
+    nav_stack(place).append((symbol, name))
+    st.session_state[f"last_opened_{place}"] = symbol
+
+
+SCROLL_TOP_JS = """<script>
+  const doc = window.parent.document;
+  for (const el of [doc.querySelector('[data-testid="stMain"]'), doc.querySelector('section.main'),
+                    doc.scrollingElement]) { if (el) el.scrollTo({top: 0}); }
+</script>"""
+
+
+def scroll_to_top():
+    if hasattr(st, "iframe"):   # fixed script written here, never user content
+        st.iframe(SCROLL_TOP_JS, height=1)
+    else:
+        components.html(SCROLL_TOP_JS, height=0)
+
+
+def navigated(place, home):
+    """If something was opened from this tab, show its full check with a back button. True if one is showing."""
+    stack = nav_stack(place)
+    if not stack:
+        return False
+    back_to = home if len(stack) == 1 else stack[-2][1]
+    if st.session_state.get(f"scrolled_{place}") != len(stack):   # jump to the top once per newly opened check
+        st.session_state[f"scrolled_{place}"] = len(stack)
+        scroll_to_top()
+    st.button(f"← Back to {back_to}", key=f"back_{place}_{len(stack)}", on_click=stack.pop)
+    show_result(stack[-1][0], place, f"{place}{len(stack)}")
+    st.button(f"← Back to {back_to}", key=f"back2_{place}_{len(stack)}", on_click=stack.pop)
+    return True
+
+
+def show_result(symbol, place, key):
+    """The full check of one stock or ETF. `place` is the tab showing it, `key` keeps its controls unique."""
+    with st.spinner("Checking the figures…"):
+        d, err = get_data(symbol)
+    if err:
+        st.error(err)
+    elif d["kind"] == "fund":
+        def _keep_depth():   # the setting outlives the control, which only exists on ETF pages
+            st.session_state["etf_depth"] = st.session_state[f"etf_depth_choice_{key}"]
+        st.radio("How thoroughly to check this ETF", list(ETF_DEPTHS), format_func=ETF_DEPTHS.get,
+                 index=list(ETF_DEPTHS).index(st.session_state["etf_depth"]),
+                 key=f"etf_depth_choice_{key}", on_change=_keep_depth, horizontal=True,
+                 help="Quick uses the top holdings Yahoo Finance lists (usually 10). Full uses the fund "
+                      "provider's complete list where it can be found and checks up to "
+                      f"{ETF_FULL_MAX} holdings, which can take a minute the first time.")
+        if (st.query_params.get("etf") == "full") != full_check_on():
+            if full_check_on():
+                st.query_params["etf"] = "full"
+            else:
+                del st.query_params["etf"]
+        with st.spinner("Checking every holding… this can take a minute the first time." if full_check_on()
+                        else "Checking what the fund holds…"):
+            s = screen_fund(d)
+        verdict_card(d, s)
+        key_figures(d)
+        source_line(d)
+        research_buttons(d)
+        fund_detail(d, s, place, key)
+    else:
+        s = screen(d)
+        verdict_card(d, s)
+        key_figures(d)
+        source_line(d)
+        research_buttons(d)
+
+        old = ([f"balance sheet at {d['as_of']}"] if d["bs_days"] > STALE_DAYS else []) + \
+              ([f"revenue from the {d['inc_label']}"] if d["inc_days"] > STALE_DAYS else [])
+        if old:
+            st.warning(f"Some figures are over a year old ({' and '.join(old)}). Yahoo Finance may be missing "
+                       f"the latest reports, so check the company's latest annual report too: "
+                       f"{source_links(d)}.")
+
+        st.subheader("Why")
+        if s["business"] == "Fail":
+            st.write(s["why"])
+        else:
+            st.write("Each figure below is compared with the company's average value over the last 2 years. "
+                     "Under 30% is compliant, 30–33% is on watch, over 33% is not compliant.")
+            for name, v in s["ratios"].items():
+                ratio_bar(name, v)
+
+        st.subheader("Cleaning dividends")
+        st.write(f"Give **{s['purge_pct']:.2%}** of every dividend from this company to charity "
+                 f"({s['purge_source'] or 'no revenue data'}).")
+        if s.get("pre_revenue"):
+            st.caption("This is high because the company has almost no sales yet, so most of its income is "
+                       "interest on its cash. Companies at this stage rarely pay dividends.")
+
+        with st.expander("More detail"):
+            by = f" ({s['checked_by']})" if s["business"] != "Review" else ""
+            st.write(f"Business check: **{s['business']}{by}**. {s['why'] if s['business'] != 'Fail' else ''}")
+            st.write(f"Industry: {d['industry'] or 'unknown'} · Reported in {d['fin_ccy']}")
+            fc = d["fin_ccy"]
+            st.write(f"Debt {money(d['debt'], fc)} · Cash & investments {money(d['cash'], fc)} · "
+                     f"Money owed {money(d['receivables'], fc)} · 2-year average value {money(d['avg_mcap'], fc)} · "
+                     f"Total assets {money(d['assets'], fc)}")
+            st.markdown("**How other standards see it**")
+            standards_table(s)
+            source_detail(d)
+
+
+def check_tab():
+    query = st.text_input("Company, ETF or share code", placeholder="e.g. Woolworths, BHP.AX, Apple, SPUS",
+                          key="check_query")
     if query:
         matches = search(query.strip())
         exact = query.strip().upper()
         if (not matches and "." in exact) or (matches and exact in [m[0] for m in matches]):
             symbol = exact
         elif matches:
-            symbol = st.selectbox("Pick the company or ETF", matches, format_func=lambda m: m[1])[0]
+            if st.session_state.get("check_pick") not in matches:
+                st.session_state.pop("check_pick", None)
+            symbol = st.selectbox("Pick the company or ETF", matches, format_func=lambda m: m[1], key="check_pick")[0]
         else:
             symbol = None
             st.warning("Nothing found. Try the full name, or the share code (ASX codes end in .AX).")
-
         if symbol:
-            with st.spinner("Checking the figures…"):
-                d, err = get_data(symbol)
-            if err:
-                st.error(err)
-            elif d["kind"] == "fund":
-                def _keep_depth():   # the setting outlives the control, which only exists on ETF pages
-                    st.session_state["etf_depth"] = st.session_state["etf_depth_choice"]
-                st.radio("How thoroughly to check this ETF", list(ETF_DEPTHS), format_func=ETF_DEPTHS.get,
-                         index=list(ETF_DEPTHS).index(st.session_state["etf_depth"]),
-                         key="etf_depth_choice", on_change=_keep_depth, horizontal=True,
-                         help="Quick uses the top holdings Yahoo Finance lists (usually 10). Full uses the fund "
-                              "provider's complete list where it can be found and checks up to "
-                              f"{ETF_FULL_MAX} holdings, which can take a minute the first time.")
-                if (st.query_params.get("etf") == "full") != full_check_on():
-                    if full_check_on():
-                        st.query_params["etf"] = "full"
-                    else:
-                        del st.query_params["etf"]
-                with st.spinner("Checking every holding… this can take a minute the first time." if full_check_on()
-                                else "Checking what the fund holds…"):
-                    s = screen_fund(d)
-                verdict_card(d, s)
-                key_figures(d)
-                source_line(d)
-                research_buttons(d)
-                fund_detail(d, s)
-            else:
-                s = screen(d)
-                verdict_card(d, s)
-                key_figures(d)
-                source_line(d)
-                research_buttons(d)
+            show_result(symbol, "check", "check")
 
-                old = ([f"balance sheet at {d['as_of']}"] if d["bs_days"] > STALE_DAYS else []) + \
-                      ([f"revenue from the {d['inc_label']}"] if d["inc_days"] > STALE_DAYS else [])
-                if old:
-                    st.warning(f"Some figures are over a year old ({' and '.join(old)}). Yahoo Finance may be missing "
-                               f"the latest reports, so check the company's latest annual report too: "
-                               f"{source_links(d)}.")
 
-                st.subheader("Why")
-                if s["business"] == "Fail":
-                    st.write(s["why"])
-                else:
-                    st.write("Each figure below is compared with the company's average value over the last 2 years. "
-                             "Under 30% is compliant, 30–33% is on watch, over 33% is not compliant.")
-                    for name, v in s["ratios"].items():
-                        ratio_bar(name, v)
+with tab_check:
+    if not navigated("check", (st.session_state.get("check_query") or "your search").strip().upper()):
+        check_tab()
 
-                st.subheader("Cleaning dividends")
-                st.write(f"Give **{s['purge_pct']:.2%}** of every dividend from this company to charity "
-                         f"({s['purge_source'] or 'no revenue data'}).")
-                if s.get("pre_revenue"):
-                    st.caption("This is high because the company has almost no sales yet, so most of its income is "
-                               "interest on its cash. Companies at this stage rarely pay dividends.")
-
-                with st.expander("More detail"):
-                    by = f" ({s['checked_by']})" if s["business"] != "Review" else ""
-                    st.write(f"Business check: **{s['business']}{by}**. {s['why'] if s['business'] != 'Fail' else ''}")
-                    st.write(f"Industry: {d['industry'] or 'unknown'} · Reported in {d['fin_ccy']}")
-                    fc = d["fin_ccy"]
-                    st.write(f"Debt {money(d['debt'], fc)} · Cash & investments {money(d['cash'], fc)} · "
-                             f"Money owed {money(d['receivables'], fc)} · 2-year average value {money(d['avg_mcap'], fc)} · "
-                             f"Total assets {money(d['assets'], fc)}")
-                    st.markdown("**How other standards see it**")
-                    standards_table(s)
-                    source_detail(d)
-
-with tab_ideas:
-    etf_mode = st.checkbox("ETFs only", value=False, help="Look through the largest ETFs in the market instead of companies")
+def ideas_tab():
+    etf_mode = st.checkbox("ETFs only", key="ideas_etf", help="Look through the largest ETFs in the market instead of companies")
     things = "ETFs" if etf_mode else "companies"
     st.write(f"The largest {things} in a market, screened with the WattleFolio rules. The top {IDEAS_SHOW} that pass "
              "are listed, sorted the way you choose.")
     st.caption(f"These are ideas to research, not recommendations or financial advice. They're ranked on figures "
                f"only, so check each one yourself before buying.")
-    market = st.selectbox("Market", list(IDEAS_MARKETS))
+    market = st.selectbox("Market", list(IDEAS_MARKETS), key="ideas_market")
     sorts = ETF_SORTS if etf_mode else IDEA_SORTS
     c1, c2 = st.columns(2)
-    sort_by = c1.selectbox("Sort by", list(sorts))
-    include_watch = c2.checkbox("Include \"on watch\" " + ("ETFs" if etf_mode else "stocks"), value=False)
-    include_manual = c2.checkbox("Include ETFs that can't be fully checked" if etf_mode
-                                 else "Include stocks that need a manual business check", value=not etf_mode)
-
     kind = "etf" if etf_mode else "stock"
+    sort_by = c1.selectbox("Sort by", list(sorts), key=f"ideas_sort_{kind}")
+    include_watch = c2.checkbox("Include \"on watch\" " + ("ETFs" if etf_mode else "stocks"), key=f"ideas_watch_{kind}")
+    include_manual = c2.checkbox("Include ETFs that can't be fully checked" if etf_mode
+                                 else "Include stocks that need a manual business check", key=f"ideas_manual_{kind}")
+
     count = IDEAS_ETF_CANDIDATES if etf_mode else IDEAS_CANDIDATES
     if st.session_state.get("ideas_search") != (market, kind):
         if st.button(f"Find {things} in {market}", type="primary"):
@@ -1371,7 +1438,10 @@ with tab_ideas:
                            f"Fees {r['fee']:.2%} a year" if r.get("fee") is not None else None,
                            f"P/E {r['pe']:.1f}" if r["pe"] else None,
                            f"Debt {r['debt']:.0%}" if r["debt"] is not None else None]
-                with st.expander(f"{i}. {d['name']} ({d['symbol']}) · {label}"):
+                with st.expander(f"{i}. {d['name']} ({d['symbol']}) · {label}",
+                                 expanded=st.session_state.get("last_opened_ideas") == d["symbol"]):
+                    st.button("Open full check →", key=f"open_ideas_{kind}_{d['symbol']}", type="primary",
+                              on_click=open_check, args=("ideas", d["symbol"], d["name"]))
                     st.write(" · ".join(f for f in figures if f))
                     if etf_mode:
                         st.write(s["why"])
@@ -1386,7 +1456,11 @@ with tab_ideas:
                             ratio_bar(name, v)
                     source_line(d)
                     research_buttons(d)
-                    st.caption("For the full check, search for this code in the \"Check\" tab.")
+
+
+with tab_ideas:
+    if not navigated("ideas", "Find stocks"):
+        ideas_tab()
 
 with tab_mine:
     st.write("Your holdings are saved in this page's link. After making changes, bookmark the page "
