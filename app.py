@@ -11,6 +11,7 @@ import math
 import os
 import urllib.request
 import re
+import time
 from urllib.parse import quote_plus
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
@@ -234,30 +235,6 @@ def newest_first(df):
     return None if df is None or df.empty else df[sorted(df.columns, reverse=True)]
 
 
-class Statement:
-    """One financial statement, read newest period first, remembering which periods the figures came from."""
-    def __init__(self, df):
-        self.df = newest_first(df)
-        self.date = self.df.columns[0] if self.df is not None else None
-        self.used = set()
-
-    def get(self, *labels):
-        if self.df is None:
-            return None
-        for label in labels:
-            if label in self.df.index:
-                row = self.df.loc[label].dropna()
-                if not row.empty:
-                    self.used.add(row.index[0])
-                    return float(row.iloc[0])
-        return None
-
-    def older(self):
-        """Earliest older period a figure had to be taken from, if the newest report was missing some."""
-        old = [x for x in self.used if x < self.date]
-        return min(old) if old else None
-
-
 @st.cache_data(ttl=15 * 60, show_spinner=False)
 def quote(symbol):
     """Latest price and previous close (in the quote's own units) and the price date. Refreshed every 15 minutes."""
@@ -334,36 +311,104 @@ def fetch_fund(t, info, symbol):
     }
 
 
+def company_info(symbol):
+    """Yahoo's company profile, retried: Yahoo sometimes sends cloud servers a blank one. (info, complete?)"""
+    info = {}
+    for attempt in range(3):
+        try:
+            info = yf.Ticker(symbol).info or {}
+        except Exception:
+            info = {}
+        if info.get("quoteType") and info.get("currency"):
+            return info, True
+        time.sleep(0.8 * (attempt + 1))
+    return info, False
+
+
+def _cell(df, col, *labels):
+    for label in labels:
+        if label in df.index:
+            v = df.at[label, col]
+            if pd.notna(v):
+                return float(v)
+    return None
+
+
+def balance_sheet_figures(df):
+    """Debt, cash, money owed and total assets, all from ONE balance sheet date: the newest that reports them.
+
+    Falls back to the newest sheet with debt, cash and total assets when the company never reports money owed
+    (then "receivables" is None)."""
+    df = newest_first(df)
+    if df is None:
+        return None
+    without_receivables = None
+    for col in df.columns:
+        assets = _cell(df, col, "Total Assets")
+        total_debt = _cell(df, col, "Total Debt")
+        current, long_term = _cell(df, col, "Current Debt"), _cell(df, col, "Long Term Debt")
+        cash_all = _cell(df, col, "Cash Cash Equivalents And Short Term Investments")
+        cash_only = _cell(df, col, "Cash And Cash Equivalents")
+        if assets is None or (total_debt is None and current is None and long_term is None) or \
+                (cash_all is None and cash_only is None):
+            continue
+        leases = _cell(df, col, "Capital Lease Obligations") or 0
+        if total_debt is not None:   # "Total Debt" includes leases
+            debt = total_debt - (0 if INCLUDE_LEASES else leases)
+        else:                        # "Current Debt" and "Long Term Debt" exclude leases
+            debt = (current or 0) + (long_term or 0) + (leases if INCLUDE_LEASES else 0)
+        cash = cash_all if cash_all is not None else cash_only + (_cell(df, col, "Other Short Term Investments") or 0)
+        figures = {"date": col, "debt": debt, "cash": cash, "assets": assets,
+                   "receivables": _cell(df, col, "Accounts Receivable", "Receivables"),
+                   "shares": _cell(df, col, "Ordinary Shares Number", "Share Issued")}
+        if figures["receivables"] is not None:
+            return figures
+        without_receivables = without_receivables or figures
+    return without_receivables
+
+
+def income_figures(df):
+    """Revenue and interest income from the same year: the newest annual report that has revenue."""
+    df = newest_first(df)
+    if df is None:
+        return None
+    for col in df.columns:
+        revenue = _cell(df, col, "Total Revenue", "Operating Revenue")
+        if revenue:
+            return {"date": col, "revenue": revenue,
+                    "interest_income": _cell(df, col, "Interest Income", "Interest Income Non Operating")}
+    return None
+
+
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def fetch(symbol):
+    info, profile_ok = company_info(symbol)
     t = yf.Ticker(symbol)
-    info = t.info or {}
+    if not profile_ok:   # fill the basics from Yahoo's price data instead
+        try:
+            t.history(period="5d")
+            md = t.get_history_metadata() or {}
+        except Exception:
+            md = {}
+        basics = {"quoteType": md.get("instrumentType"), "currency": md.get("currency"),
+                  "longName": md.get("longName"), "shortName": md.get("shortName"),
+                  "fullExchangeName": md.get("fullExchangeName"), "exchange": md.get("exchangeName")}
+        info = {**{k: v for k, v in basics.items() if v}, **{k: v for k, v in info.items() if v}}
     if info.get("quoteType") in ("ETF", "MUTUALFUND"):
         return fetch_fund(t, info, symbol)
-    # Use whichever balance sheet is newer: the annual report or the latest interim (half-year/quarterly) one
-    annual, interim = Statement(t.balance_sheet), Statement(t.quarterly_balance_sheet)
-    choices = [(st_.date, kind, st_) for kind, st_ in (("annual", annual), ("interim", interim)) if st_.date is not None]
-    if not choices:
-        raise ValueError("no company figures found")
-    _, bs_kind, bs = max(choices, key=lambda c: c[0])   # a tie keeps the annual report
-    inc = Statement(t.income_stmt)
 
-    debt = bs.get("Total Debt")
-    if debt is not None:
-        # "Total Debt" includes leases
-        if not INCLUDE_LEASES:
-            debt -= bs.get("Capital Lease Obligations") or 0
-    else:
-        # "Current Debt" and "Long Term Debt" exclude leases
-        debt = (bs.get("Current Debt") or 0) + (bs.get("Long Term Debt") or 0)
-        if INCLUDE_LEASES:
-            debt += bs.get("Capital Lease Obligations") or 0
-    cash = bs.get("Cash Cash Equivalents And Short Term Investments")
-    if cash is None:
-        cash = (bs.get("Cash And Cash Equivalents") or 0) + (bs.get("Other Short Term Investments") or 0)
+    # Balance sheet: whichever is newer, the annual report or the latest interim (half-year/quarterly) one,
+    # with every figure taken from that same date
+    sheets = [(f["date"], kind, f) for kind, f in (("annual", balance_sheet_figures(t.balance_sheet)),
+                                                   ("interim", balance_sheet_figures(t.quarterly_balance_sheet))) if f]
+    if not sheets:
+        raise ValueError("no complete balance sheet found")
+    _, bs_kind, bs = max(sheets, key=lambda c: c[0])   # a tie keeps the annual report
+    inc = income_figures(t.income_stmt) or {}
 
     quote_ccy = info.get("currency")
     fin_ccy = info.get("financialCurrency") or quote_ccy
+    fin_ccy_assumed = not info.get("financialCurrency")
     divisor = 1
     if quote_ccy in MINOR_UNITS:
         quote_ccy, divisor = MINOR_UNITS[quote_ccy]
@@ -376,7 +421,7 @@ def fetch(symbol):
         except Exception:
             shares = None
     if not shares:
-        shares = bs.get("Ordinary Shares Number", "Share Issued")
+        shares = bs["shares"]
     closes = t.history(period="3y", interval="1mo", auto_adjust=False)["Close"].dropna()
     if not shares or closes.empty:
         raise ValueError("no share price data found")
@@ -399,29 +444,31 @@ def fetch(symbol):
         "price_date": f"end of {closes.index[-1]:%b %Y}",
         "price_ccy": quote_ccy,
         "fin_ccy": fin_ccy,
+        "fin_ccy_assumed": fin_ccy_assumed,
+        "profile_missing": not profile_ok,
         "divisor": divisor, "conv": conv, "shares": float(shares),
-        "revenue": inc.get("Total Revenue", "Operating Revenue"),
-        "interest_income": inc.get("Interest Income", "Interest Income Non Operating"),
-        "debt": debt,
-        "cash": cash,
-        "receivables": bs.get("Accounts Receivable", "Receivables") or 0.0,
-        "assets": bs.get("Total Assets"),
+        "revenue": inc.get("revenue"),
+        "interest_income": inc.get("interest_income"),
+        "interest_missing": bool(inc) and inc.get("interest_income") is None,
+        "debt": bs["debt"],
+        "cash": bs["cash"],
+        "receivables": bs["receivables"] or 0.0,
+        "receivables_missing": bs["receivables"] is None,
+        "assets": bs["assets"],
         "avg_mcap": float(closes.iloc[-24:].mean()) * shares * conv,
         "avg_mcap_36": float(closes.iloc[-36:].mean()) * shares * conv,
         "dps_12m": dividends_12m(t, divisor),
         "ret_1y": float(closes.iloc[-1] / closes.iloc[-13] - 1) if len(closes) >= 13 else None,
         "mcap": float(closes.iloc[-1]) * shares * conv,
-        "as_of": bs.date.strftime("%d %b %Y"),
+        "as_of": bs["date"].strftime("%d %b %Y"),
         "checked_at": datetime.now(APP_TZ).strftime("%d %b %Y, %H:%M %Z"),
         "bs_kind": bs_kind,
-        "bs_label": (f"{bs.date:%d %b %Y} (FY{bs.date.year} annual report)" if bs_kind == "annual"
-                     else f"{bs.date:%d %b %Y} (latest half-year or quarterly report)"),
-        "bs_older": bs.older().strftime("%d %b %Y") if bs.older() is not None else None,
-        "inc_label": (f"FY{inc.date.year} annual report (year to {inc.date:%d %b %Y})" if inc.date is not None
+        "bs_label": (f"{bs['date']:%d %b %Y} (FY{bs['date'].year} annual report)" if bs_kind == "annual"
+                     else f"{bs['date']:%d %b %Y} (latest half-year or quarterly report)"),
+        "inc_label": (f"FY{inc['date'].year} annual report (year to {inc['date']:%d %b %Y})" if inc
                       else "not available"),
-        "inc_older": inc.older().strftime("%d %b %Y") if inc.older() is not None else None,
-        "bs_days": days_old(bs.date),
-        "inc_days": days_old(inc.date) if inc.date is not None else 0,
+        "bs_days": days_old(bs["date"]),
+        "inc_days": days_old(inc["date"]) if inc else 0,
     }
 
 
@@ -1122,14 +1169,19 @@ def source_detail(d):
     lines = [f"- **Share price:** {d['price_ccy']} {d['price']:,.3f} on {d['price_date']} "
              f"(refreshed every 15 minutes, may be delayed about 20 minutes by the exchange)"]
     if d["kind"] == "stock":
-        lines += [f"- **Debt, cash, money owed, total assets:** balance sheet at {d['bs_label']}",
-                  f"- **Revenue and interest income:** {d['inc_label']}",
-                  f"- **Market value:** month-end share prices for the last 2 and 3 years × "
-                  f"{d['shares']:,.0f} shares on issue now; current value uses today's price"]
-        if d.get("bs_older"):
-            lines.append(f"- Some balance sheet figures were missing from that report, so ones from {d['bs_older']} were used")
-        if d.get("inc_older"):
-            lines.append(f"- Some income figures were missing from that report, so ones from {d['inc_older']} were used")
+        lines += [f"- **Debt, cash, money owed, total assets:** all from the same balance sheet, at {d['bs_label']}. "
+                  f"That's the newest balance sheet Yahoo Finance has that reports all of them.",
+                  f"- **Revenue and interest income:** both from the {d['inc_label']}",
+                  f"- **Market value** (what each figure is compared with): the average of month-end share prices "
+                  f"over the last 2 years (3 for S&P), × {d['shares']:,.0f} shares on issue now. Averaging smooths "
+                  f"out short price swings, as the index providers do; AAOIFI uses today's value instead"]
+        if d.get("receivables_missing"):
+            lines.append("- That balance sheet doesn't report money owed to the company, so it's counted as 0")
+        if d.get("interest_missing"):
+            lines.append("- That annual report doesn't show interest income, so the dividend-cleaning estimate is 0")
+        if d.get("fin_ccy_assumed"):
+            lines.append(f"- Yahoo didn't say which currency the accounts are in, so {d['fin_ccy']} (the share price "
+                         f"currency) is assumed. Check the annual report if the company reports in another currency")
     lines.append(f"- **Source:** {source_links(d)}. Company figures are refreshed every 6 hours.")
     st.markdown("**Where these figures come from**\n\n" + "\n".join(lines))
 
@@ -1167,7 +1219,10 @@ def money(x, ccy=""):
 
 def get_data(symbol):
     try:
-        d = dict(fetch(symbol))
+        cached = fetch(symbol)
+        if cached.get("profile_missing"):   # show it now, but fetch again next time instead of keeping it 6 hours
+            fetch.clear(symbol)
+        d = dict(cached)
     except Exception as e:
         return None, f"Couldn't get figures for {symbol} right now ({e}). Check the code, or try again in a few minutes."
     try:
@@ -1357,6 +1412,10 @@ def show_result(symbol, place, key):
         d, err = get_data(symbol)
     if d is not None and key == "check":   # what "← Back to …" says after opening something from this result
         st.session_state["check_label"] = name_code(d["name"], d["symbol"])
+    if d is not None and d.get("profile_missing"):
+        st.info("Yahoo Finance didn't send this company's profile this time (industry, description and reporting "
+                "currency), so the business check needs a manual review. The financial figures are unaffected. "
+                "Search again in a few minutes for the full result.")
     if err:
         st.error(err)
     elif d["kind"] == "fund":
@@ -1416,7 +1475,8 @@ def show_result(symbol, place, key):
         with st.expander("More detail"):
             by = f" ({s['checked_by']})" if s["business"] != "Review" else ""
             st.write(f"Business check: **{s['business']}{by}**. {s['why'] if s['business'] != 'Fail' else ''}")
-            st.write(f"Industry: {d['industry'] or 'unknown'} · Reported in {d['fin_ccy']}")
+            ccy_note = f"{d['fin_ccy']} (assumed)" if d.get("fin_ccy_assumed") else d["fin_ccy"]
+            st.write(f"Industry: {d['industry'] or 'not provided by Yahoo'} · Accounts reported in {ccy_note}")
             fc = d["fin_ccy"]
             st.write(f"Debt {money(d['debt'], fc)} · Cash & investments {money(d['cash'], fc)} · "
                      f"Money owed {money(d['receivables'], fc)} · 2-year average value {money(d['avg_mcap'], fc)} · "
@@ -1765,7 +1825,9 @@ Finance exchange rates. Your choice is saved in the page link. The Shariah ratio
 **Where the figures come from.** Everything comes from Yahoo Finance. Share prices refresh every
 15 minutes (the exchange may delay them about 20 minutes). Company figures refresh every 6 hours and use the
 newest report Yahoo has: the latest half-year or quarterly balance sheet if it's newer than the annual
-report, and revenue from the latest annual report. Each stock shows the dates under its result, and
+report, and revenue from the latest annual report. Debt, cash, money owed and total assets always come from the
+same balance sheet (the newest one that reports all of them), and revenue and interest income from the same
+year, so no ratio mixes figures from different reports. Each stock shows the dates under its result, and
 "More detail" lists exactly which report each figure comes from. The buttons under each result open Yahoo Finance,
 the company's annual reports (ASX announcements, SEC 10-K filings or Bursa Malaysia announcements), its website,
 and a search for its latest annual report, so you can check the figures yourself.
