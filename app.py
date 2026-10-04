@@ -639,6 +639,14 @@ MIX_GROUPS = [("Compliant", "var(--wf-good)"), ("Needs review", "var(--wf-watch)
               ("Not compliant", "var(--wf-bad)"), ("Couldn't check", "var(--wf-muted)")]
 
 
+def name_code(name, code):
+    """How a share is shown everywhere: Company name (CODE)."""
+    name, code = (name or "").strip(), (code or "").strip()
+    if not code or name.upper() == code.upper():
+        return name or code
+    return f"{name} ({code})" if name else code
+
+
 def holdings_mix(rows, extras):
     """Share of the whole fund (by weight) in each result group, plus extras such as cash or unchecked holdings."""
     mix = {g: {"weight": 0.0, "count": 0} for g, _ in MIX_GROUPS}
@@ -695,7 +703,7 @@ def screen_fund(f, allow_upload=True, want_full=None):
         checked += e["weight"]
         purge_sum += e["weight"] * hs["purge_pct"]
         if hs["tier"] == "Tier 3":
-            failed.append(d["name"])
+            failed.append(name_code(d["name"], d["symbol"]))
         watch = watch or hs["tier"] == "Tier 2"
 
     listed = sum(e["weight"] for e in entries)
@@ -1036,8 +1044,8 @@ def fund_detail(d, s, place="check", key="check"):
 
         def holding_rows(rows):
             return "".join(
-                f'<div class="holding"><div><div class="nm">{html.escape(r["Holding"])}</div>'
-                f'<div class="meta"><span>{html.escape(r["Code"])}</span>{pill(r["Result"], r["tier"])}</div></div>'
+                f'<div class="holding"><div><div class="nm">{html.escape(name_code(r["Holding"], r["Code"]))}</div>'
+                f'<div class="meta">{pill(r["Result"], r["tier"])}</div></div>'
                 f'<div class="wt">{r["Weight"]:.1%}</div></div>' for r in rows)
         st.markdown(holding_rows(s["rows"][:15]), unsafe_allow_html=True)
         if len(s["rows"]) > 15:
@@ -1310,7 +1318,7 @@ def nav_stack(place):
 
 
 def open_check(place, symbol, name):
-    nav_stack(place).append((symbol, name))
+    nav_stack(place).append((symbol, name_code(name, symbol)))
     st.session_state[f"last_opened_{place}"] = symbol
 
 
@@ -1347,6 +1355,8 @@ def show_result(symbol, place, key):
     """The full check of one stock or ETF. `place` is the tab showing it, `key` keeps its controls unique."""
     with st.spinner("Checking the figures…"):
         d, err = get_data(symbol)
+    if d is not None and key == "check":   # what "← Back to …" says after opening something from this result
+        st.session_state["check_label"] = name_code(d["name"], d["symbol"])
     if err:
         st.error(err)
     elif d["kind"] == "fund":
@@ -1436,7 +1446,7 @@ def check_tab():
 
 
 with tab_check:
-    if not navigated("check", (st.session_state.get("check_query") or "your search").strip().upper()):
+    if not navigated("check", st.session_state.get("check_label") or "your search"):
         check_tab()
 
 def ideas_tab():
@@ -1586,8 +1596,8 @@ def watchlist_tab():
         used, checked, old = based_on(d, s)
         warn = '<div class="wsub down">Some figures are over a year old</div>' if old else ""
         st.markdown(
-            f'<div class="wcard"><div class="wtop"><span><b>{html.escape(d["name"])}</b> '
-            f'<small>{html.escape(d["symbol"])}</small></span>{pill(status, s["tier"])}</div>'
+            f'<div class="wcard"><div class="wtop"><span><b>{html.escape(name_code(d["name"], d["symbol"]))}</b>'
+            f'</span>{pill(status, s["tier"])}</div>'
             f'<div class="wprice">{price_text(d["price"], d["price_ccy"])}{change}</div>'
             f'<div class="wsub"><b>Based on:</b> {html.escape(used)}</div>'
             f'<div class="wsub">{html.escape(checked)}</div>{warn}</div>', unsafe_allow_html=True)
@@ -1651,7 +1661,7 @@ with tab_mine:
                 when = (f"{r['days_left']} days left to sell" if r["days_left"] is not None and r["days_left"] >= 0
                         else "selling deadline has passed" if r["days_left"] is not None
                         else "add the date it turned red to see the deadline")
-                lines.append(f"- **{r['d']['name']}**: {when}")
+                lines.append(f"- **{name_code(r['d']['name'], r['d']['symbol'])}**: {when}")
             st.error("Not compliant, sell within 60 days:\n" + "\n".join(lines))
 
         for r in rows:
@@ -1660,7 +1670,7 @@ with tab_mine:
             flag = " · business needs a manual check" if r["s"]["business"] == "Review" else ""
             st.markdown(f"""
             <div class="verdict" style="background:{bg};color:{fg};padding:0.9rem 1.1rem;margin:0.5rem 0">
-              <div style="font-size:1.25rem;font-weight:700">{html.escape(r['d']['name'])}: {label}</div>
+              <div style="font-size:1.25rem;font-weight:700">{html.escape(name_code(r['d']['name'], r['d']['symbol']))}: {label}</div>
               <div style="font-size:1rem">{action}{flag}</div>
               <div class="who" style="margin-top:0.4rem">Value {money(r['value'], r['d']['price_ccy'])} · price {r['d']['price_date']}</div>
             </div>""", unsafe_allow_html=True)
