@@ -1223,11 +1223,26 @@ def money(x, ccy=""):
     return f"{x:,.2f} {ccy}".strip()
 
 
+@st.cache_data(ttl=15 * 60, show_spinner=False)
+def fetch_failure(symbol):
+    """Why a code couldn't be fetched (or None), remembered for 15 minutes so a missing code isn't retried
+    on every tap, e.g. the "AAPL.AX" the app tries first for an ASX fund's US holdings."""
+    try:
+        fetch(symbol)
+        return None
+    except Exception as e:
+        return str(e) or type(e).__name__
+
+
 def get_data(symbol):
+    failure = fetch_failure(symbol)
+    if failure:
+        return None, f"Couldn't get figures for {symbol} right now ({failure}). Check the code, or try again in a few minutes."
     try:
         cached = fetch(symbol)
         if cached.get("profile_missing") and time.time() - cached.get("fetched_ts", 0) > PROFILE_RETRY_MINUTES * 60:
             fetch.clear(symbol)   # incomplete result: ask Yahoo again after a while instead of keeping it 6 hours
+            fetch_failure.clear(symbol)
             cached = fetch(symbol)
         d = dict(cached)
     except Exception as e:
@@ -1615,6 +1630,38 @@ def add_typed_code():
     st.session_state["watch_add"] = ""
 
 
+REFRESH_COOLDOWN = 60   # seconds between watchlist refreshes, so Yahoo isn't asked too often
+
+
+def ask_refresh():
+    wait = REFRESH_COOLDOWN - (time.time() - st.session_state.get("watch_refreshed_ts", 0))
+    if wait > 0:
+        st.session_state["watch_refresh_msg"] = f"Just refreshed. You can refresh again in {wait:.0f} seconds."
+    else:
+        st.session_state["watch_refresh_pending"] = True
+
+
+def refresh_watchlist(symbols):
+    """Drop the saved data for these stocks/ETFs (and an ETF's top holdings) so they're fetched fresh."""
+    to_clear = set()
+    for sym in symbols:
+        to_clear.add(sym)
+        try:
+            d = fetch(sym)   # the saved result, to find an ETF's holdings
+        except Exception:
+            continue
+        if d.get("kind") == "fund":
+            for ticker, _, _ in d.get("holdings", []):
+                to_clear.update(yahoo_candidates(ticker, "", sym))
+    for sym in to_clear:
+        fetch.clear(sym)
+        fetch_failure.clear(sym)
+        quote.clear(sym)
+    fx_rate.clear()         # fresh exchange rates and ETF provider files too
+    download_file.clear()
+    st.session_state["watch_refreshed_ts"] = time.time()
+
+
 def watchlist_tab():
     st.write("A quick overview of the shares and ETFs you're keeping an eye on. Your watchlist is saved in this "
              "page's link, so bookmark it or add it to your home screen.")
@@ -1627,6 +1674,20 @@ def watchlist_tab():
         st.info("Your watchlist is empty. Add a code above, or tap ☆ Add to watchlist on any result in Check or Find.")
         return
 
+    refreshing = st.session_state.pop("watch_refresh_pending", False)
+    if refreshing:
+        with st.spinner("Fetching fresh data for your watchlist…"):
+            refresh_watchlist(wl)
+    msg = st.session_state.pop("watch_refresh_msg", None)
+    if msg:
+        st.toast(msg)
+    r1, r2 = st.columns([1, 2], vertical_alignment="center")
+    r1.button("↻ Refresh", on_click=ask_refresh, width="stretch",
+              help="Fetch fresh prices, company figures and ETF holdings from Yahoo Finance for everything below")
+    last = st.session_state.get("watch_refreshed_ts")
+    r2.caption(f"Last refreshed {datetime.fromtimestamp(last, APP_TZ):%H:%M %Z}" if last else
+               "Results are saved for up to 6 hours (prices 15 minutes). Refresh to fetch the latest now.")
+
     ctx = get_script_run_ctx()
 
     def check(sym):
@@ -1636,6 +1697,8 @@ def watchlist_tab():
     with st.spinner("Checking your watchlist…"):
         with ThreadPoolExecutor(max_workers=6, initializer=lambda: add_script_run_ctx(None, ctx)) as pool:
             items = list(pool.map(check, wl))
+    if refreshing:
+        st.toast("Watchlist refreshed with the latest data from Yahoo Finance.")
 
     counts = {}
     for _, d, _, s in items:
@@ -1810,7 +1873,8 @@ recommendations. The list is worked out once a day, so the first search of the d
 **8. Watchlist.** Add any share or ETF with **☆ Add to watchlist** on its result, **☆ Watch** in Find, or by
 typing its code in the Watchlist tab. Each one shows whether it's compliant, its price, and what the result is
 based on: the annual report and balance sheet dates (or where an ETF's holdings came from) and when WattleFolio
-last checked it. Your watchlist is saved in the page link.
+last checked it. Tap **↻ Refresh** to fetch the latest data for everything on it (once a minute at most).
+Your watchlist is saved in the page link.
 
 **How the WattleFolio rules compare with the main standards.** Our rules are closest to Dow Jones Islamic
 (same 2-year average), but stricter: on-watch starts at 30%. Each stock's
