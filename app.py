@@ -15,7 +15,7 @@ import time
 from urllib.parse import quote_plus
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pandas as pd
 import streamlit as st
@@ -48,7 +48,11 @@ FUND_MAX_BONDS = 0.01     # conventional bonds pay interest; more than this fail
 ETF_FULL_TARGET = 0.95
 ETF_FULL_MAX = 150
 HOLDINGS_DIR = "etf_holdings"
-APP_TZ = ZoneInfo("Australia/Sydney")   # times shown in the app (e.g. when a check was done)
+try:
+    APP_TZ = ZoneInfo("Australia/Sydney")   # times shown in the app (e.g. when a check was done)
+except ZoneInfoNotFoundError:            # server without time-zone data (tzdata is in requirements.txt)
+    APP_TZ = ZoneInfo("UTC")
+PROFILE_RETRY_MINUTES = 15   # keep a result with a blank Yahoo profile this long before asking Yahoo again
 ETF_DEPTHS = {"quick": "Quick: top holdings from Yahoo",
               "full": "Full: every holding from the fund provider (slower)"}
 SPDR_HOLDINGS_URL = "https://www.ssga.com/us/en/intermediary/etfs/library-content/products/fund-data/etfs/us/holdings-daily-us-en-{}.xlsx"
@@ -314,14 +318,15 @@ def fetch_fund(t, info, symbol):
 def company_info(symbol):
     """Yahoo's company profile, retried: Yahoo sometimes sends cloud servers a blank one. (info, complete?)"""
     info = {}
-    for attempt in range(3):
+    for attempt in range(2):   # one quick retry: more only adds load when Yahoo is limiting the server
         try:
             info = yf.Ticker(symbol).info or {}
         except Exception:
             info = {}
         if info.get("quoteType") and info.get("currency"):
             return info, True
-        time.sleep(0.8 * (attempt + 1))
+        if attempt == 0:
+            time.sleep(0.5)
     return info, False
 
 
@@ -462,6 +467,7 @@ def fetch(symbol):
         "mcap": float(closes.iloc[-1]) * shares * conv,
         "as_of": bs["date"].strftime("%d %b %Y"),
         "checked_at": datetime.now(APP_TZ).strftime("%d %b %Y, %H:%M %Z"),
+        "fetched_ts": time.time(),
         "bs_kind": bs_kind,
         "bs_label": (f"{bs['date']:%d %b %Y} (FY{bs['date'].year} annual report)" if bs_kind == "annual"
                      else f"{bs['date']:%d %b %Y} (latest half-year or quarterly report)"),
@@ -1220,8 +1226,9 @@ def money(x, ccy=""):
 def get_data(symbol):
     try:
         cached = fetch(symbol)
-        if cached.get("profile_missing"):   # show it now, but fetch again next time instead of keeping it 6 hours
-            fetch.clear(symbol)
+        if cached.get("profile_missing") and time.time() - cached.get("fetched_ts", 0) > PROFILE_RETRY_MINUTES * 60:
+            fetch.clear(symbol)   # incomplete result: ask Yahoo again after a while instead of keeping it 6 hours
+            cached = fetch(symbol)
         d = dict(cached)
     except Exception as e:
         return None, f"Couldn't get figures for {symbol} right now ({e}). Check the code, or try again in a few minutes."
@@ -1415,7 +1422,7 @@ def show_result(symbol, place, key):
     if d is not None and d.get("profile_missing"):
         st.info("Yahoo Finance didn't send this company's profile this time (industry, description and reporting "
                 "currency), so the business check needs a manual review. The financial figures are unaffected. "
-                "Search again in a few minutes for the full result.")
+                f"The app asks Yahoo again after {PROFILE_RETRY_MINUTES} minutes.")
     if err:
         st.error(err)
     elif d["kind"] == "fund":
