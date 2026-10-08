@@ -195,7 +195,14 @@ html, body, .stApp, .stApp p, .stApp li, .stApp input, .stApp button, .stApp lab
 .card .sub { font-size: 0.85rem; opacity: 0.75; margin: 0.1rem 0 0.4rem; }
 .card .line { display: flex; justify-content: space-between; gap: 0.75rem; font-size: 0.95rem; padding: 0.15rem 0; }
 .card .line span:last-child { text-align: right; }
-.card .line.bad span:last-child { color: var(--wf-bad); font-weight: 700; }
+.card .line.bad span:last-child, .card .line.fail span:last-child { color: var(--wf-bad); font-weight: 700; }
+.card .line.warn span:last-child, .card .line.watch span:last-child { color: var(--wf-t2-fg); font-weight: 600; }
+.card .line span:last-child small { font-weight: 400; }
+.card .why { color: var(--wf-ink); font-size: 0.85rem; margin-top: 0.35rem; line-height: 1.4; }
+.mk { font-style: normal; display: inline-block; width: 1.1rem; font-weight: 700; flex: none; }
+.card .line span:first-child { display: flex; white-space: nowrap; }
+.mk.pass { color: var(--wf-good); } .mk.fail { color: var(--wf-bad); }
+.mk.warn, .mk.watch { color: var(--wf-t2-fg); } .mk.na { color: var(--wf-muted); }
 .card small { opacity: 0.7; }
 .pill { display: inline-block; border-radius: 999px; padding: 0.1rem 0.6rem; font-size: 0.8rem; font-weight: 600; white-space: nowrap; }
 .holding { display: flex; justify-content: space-between; align-items: flex-start; gap: 0.75rem; padding: 0.55rem 0;
@@ -502,37 +509,129 @@ def review_pct(review):
         return None
 
 
-def standards(d, failed_business):
-    """Other standards' ratio tests: {name: (basis, [(test, value, limit)], result)}."""
+def _pct(v):
+    return "–" if v is None else f"{v:.1%}"
+
+
+def _limit_test(label, value, limit):
+    """A ratio test line: (label, shown value, status) with status pass / fail / na."""
+    if value is None:
+        return (label, "figure missing", "na")
+    return (label, f"{_pct(value)} <small>/ max {limit * 100:g}%</small>", "pass" if value <= limit else "fail")
+
+
+def _plain(value_html):
+    t = re.sub(r"<[^>]+>", "", value_html).strip().rstrip(".")
+    return t[:1].lower() + t[1:]
+
+
+WARN_PHRASES = {"Business activity": "the business activity needs a manual check",
+                "Income test": "the income test isn't meaningful yet, as the company has almost no sales"}
+
+
+def _summary(tests):
+    """One plain sentence on why a standard passes or fails, from its test lines."""
+    fails = [t for t in tests if t[2] == "fail"]
+    passes = [t[0].lower() for t in tests if t[2] == "pass"]
+    warns = [t for t in tests if t[2] == "warn"]
+    missing = [t[0].lower() for t in tests if t[2] == "na"]
+    if fails:
+        why = "Fails: " + "; ".join(f"{t[0].lower()} ({_plain(t[1])})" for t in fails) + "."
+        return why + (f" Passes: {', '.join(passes)}." if passes else "")
+    if missing:
+        return f"Can't be fully checked: {', '.join(missing)} missing."
+    if warns:
+        return "The numbers pass, but " + " and ".join(WARN_PHRASES.get(t[0], _plain(t[1])) for t in warns) + "."
+    return "Passes every test."
+
+
+def standards(d, business_kind, business_note, income):
+    """Each standard's tests as shown in "How other standards see it".
+
+    business_kind: excluded / review / pass. income: {"revenue": share of revenue, "total": share of total income,
+    "source": text, "na": reason or None, "pre_revenue": bool}.
+    Returns {name: {"basis", "tests": [(label, value_html, status)], "result", "summary"}}."""
     cash_recv = d["cash"] + d["receivables"] if d["cash"] is not None else None
-    djim_tests = [("Debt", ratio(d["debt"], d["avg_mcap"]), DJIM_LIMIT)]
+
+    def income_line(share_of):
+        if income.get("pre_revenue"):
+            return ("Income test", "Not meaningful yet: the company has almost no sales.", "warn")
+        if income.get("na"):
+            return ("Income test", income["na"], "na")
+        v = income[share_of]
+        what = "of total income" if share_of == "total" else "of revenue"
+        return ("Income test", f"{_pct(v)} {what} <small>/ under 5%</small>",
+                "pass" if v < REVENUE_LIMIT else "fail")
+
+    business_line = None
+    if business_kind == "excluded":
+        business_line = ("Business activity", html.escape(business_note), "fail")
+    elif business_kind == "review":
+        business_line = ("Business activity", "Needs a manual check.", "warn")
+
+    djim = [_limit_test("Debt", ratio(d["debt"], d["avg_mcap"]), DJIM_LIMIT)]
     if DJIM_TEST_CASH_RECEIVABLES:
-        djim_tests += [("Cash", ratio(d["cash"], d["avg_mcap"]), DJIM_LIMIT),
-                       ("Receivables", ratio(d["receivables"], d["avg_mcap"]), DJIM_LIMIT)]
+        djim += [_limit_test("Cash", ratio(d["cash"], d["avg_mcap"]), DJIM_LIMIT),
+                 _limit_test("Receivables", ratio(d["receivables"], d["avg_mcap"]), DJIM_LIMIT)]
     out = {
+        # AAOIFI Standard 21 measures non-permissible income against the company's total income
         "AAOIFI": ("current market value", [
-            ("Debt", ratio(d["debt"], d["mcap"]), AAOIFI_LIMIT),
-            ("Cash", ratio(d["cash"], d["mcap"]), AAOIFI_LIMIT)]),
-        "Dow Jones Islamic": ("2-year average market value", djim_tests),
+            _limit_test("Debt", ratio(d["debt"], d["mcap"]), AAOIFI_LIMIT),
+            _limit_test("Cash", ratio(d["cash"], d["mcap"]), AAOIFI_LIMIT), income_line("total")]),
+        "Dow Jones Islamic": ("2-year average market value", djim + [income_line("revenue")]),
         "S&P Shariah": ("3-year average market value", [
-            ("Debt", ratio(d["debt"], d["avg_mcap_36"]), SP_LIMIT),
-            ("Cash", ratio(d["cash"], d["avg_mcap_36"]), SP_LIMIT),
-            ("Receivables + cash", ratio(cash_recv, d["avg_mcap_36"]), SP_RECEIVABLES_LIMIT)]),
+            _limit_test("Debt", ratio(d["debt"], d["avg_mcap_36"]), SP_LIMIT),
+            _limit_test("Cash", ratio(d["cash"], d["avg_mcap_36"]), SP_LIMIT),
+            _limit_test("Receivables + cash", ratio(cash_recv, d["avg_mcap_36"]), SP_RECEIVABLES_LIMIT),
+            income_line("revenue")]),
         "MSCI Islamic": ("total assets", [
-            ("Debt", ratio(d["debt"], d["assets"]), MSCI_LIMIT),
-            ("Cash", ratio(d["cash"], d["assets"]), MSCI_LIMIT),
-            ("Receivables + cash", ratio(cash_recv, d["assets"]), MSCI_LIMIT)]),
+            _limit_test("Debt", ratio(d["debt"], d["assets"]), MSCI_LIMIT),
+            _limit_test("Cash", ratio(d["cash"], d["assets"]), MSCI_LIMIT),
+            _limit_test("Receivables + cash", ratio(cash_recv, d["assets"]), MSCI_LIMIT), income_line("revenue")]),
     }
     results = {}
     for name, (basis, tests) in out.items():
-        if failed_business:
-            result = "Fail (business)"
-        elif any(v is None for _, v, _ in tests):
-            result = "n/a"
-        else:
-            result = "Pass" if all(v <= limit for _, v, limit in tests) else "Fail"
-        results[name] = (basis, tests, result)
+        if business_line:
+            tests = tests + [business_line]
+        statuses = {t[2] for t in tests}
+        result = ("Fail" if "fail" in statuses else "n/a" if "na" in statuses
+                  else "Needs a look" if "warn" in statuses else "Pass")
+        results[name] = {"basis": basis, "tests": tests, "result": result, "summary": _summary(tests)}
     return results
+
+
+def wattlefolio_card(d, s):
+    """The WattleFolio rules laid out like the other standards, so the verdict at the top is explained."""
+    tests = []
+    for label, key in (("Debt", "Debt"), ("Cash", "Cash & interest-earning investments"),
+                       ("Money owed", "Money owed to the company")):
+        v = s["ratios"][key]
+        if v is None:
+            tests.append((label, "figure missing", "na"))
+        else:
+            status = "pass" if v <= TIER1_MAX else "watch" if v <= TIER2_MAX else "fail"
+            tests.append((label, f"{_pct(v)} <small>/ {TIER1_MAX * 100:g}% (watch {TIER2_MAX * 100:g}%)</small>", status))
+    inc = s["income"]
+    if inc.get("pre_revenue"):
+        tests.append(("Income test", "Not meaningful yet: the company has almost no sales.", "warn"))
+    elif inc.get("na"):
+        tests.append(("Income test", inc["na"], "na"))
+    else:
+        tests.append(("Income test", f"{_pct(inc['revenue'])} of revenue <small>/ under 5%</small>",
+                      "pass" if inc["revenue"] < REVENUE_LIMIT else "fail"))
+    if s["business_kind"] == "excluded":
+        tests.append(("Business activity", html.escape(s["business_note"]), "fail"))
+    elif s["business_kind"] == "review":
+        tests.append(("Business activity", "Needs a manual check.", "warn"))
+    elif s["business_kind"] == "pass":
+        tests.append(("Business activity", "Passes" + (" (checked manually)" if s["checked_by"] == "manual" else
+                                                       " (automatic check)"), "pass"))
+    summary = _summary([(t[0], t[1], "warn" if t[2] == "watch" else t[2]) for t in tests])
+    if any(t[2] == "watch" for t in tests) and not any(t[2] == "fail" for t in tests):
+        summary = "On watch: " + ", ".join(t[0].lower() for t in tests if t[2] == "watch") + \
+                  f" is between {TIER1_MAX * 100:g}% and {TIER2_MAX * 100:g}%."
+    return {"basis": "2-year average market value", "tests": tests, "result": TIER_STYLE[s["tier"]][0],
+            "summary": summary}
 
 
 FLAG_RE = re.compile(r"\b(" + "|".join(re.escape(w).replace(r"\*", r"\w*") for w in DESCRIPTION_FLAGS) + r")\b",
@@ -549,21 +648,29 @@ def screen(d):
     industry = f'{d["industry"]} {d["sector"]}'.lower()
 
     # Non-permissible revenue: review-list figure if entered, otherwise interest income as an estimate
-    np_pct, np_source = None, ""
+    np_pct, np_source, np_total = None, "", None
     if review is not None and review_pct(review) is not None:
         np_pct, np_source = review_pct(review), "WattleFolio review list"
+        np_total = np_pct
     elif d["revenue"]:
-        np_pct, np_source = min(abs(d["interest_income"] or 0) / d["revenue"], 1.0), "estimate (interest income only)"
+        interest = abs(d["interest_income"] or 0)
+        np_pct, np_source = min(interest / d["revenue"], 1.0), "estimate (interest income only)"
+        np_total = interest / (d["revenue"] + interest)   # AAOIFI: share of total income
         if review is not None and review["non_permissible_revenue_pct"].strip():
             np_source += "; the figure in the review list couldn't be read"
 
     # Almost no sales yet (explorers, biotechs): interest on cash dwarfs revenue, so the 5% test says little
-    pre_revenue = np_source.startswith("estimate") and np_pct is not None and np_pct >= PRE_REVENUE_SHARE
+    excluded_industry = review is None and any(k in industry for k in EXCLUDED_KEYWORDS)
+    pre_revenue = (np_source.startswith("estimate") and np_pct is not None and np_pct >= PRE_REVENUE_SHARE
+                   and not excluded_industry)   # banks earn mostly interest: that's not "no sales yet"
     checked_by = "manual" if review is not None and review["excluded"].strip().lower() in ("yes", "no") else "automatic"
+    business_kind, business_note = "pass", ""
     if review is not None and review["excluded"].strip().lower() == "yes":
         business, why = "Fail", "Marked as excluded in the WattleFolio review list."
+        business_kind, business_note = "excluded", "Marked as excluded in the review list"
     elif review is None and any(k in industry for k in EXCLUDED_KEYWORDS):
         business, why = "Fail", f"Its industry ({d['industry']}) is on the excluded list."
+        business_kind, business_note = "excluded", f"Excluded industry: {d['industry']}"
     elif np_pct is not None and np_pct >= REVENUE_LIMIT and not pre_revenue:
         business, why = "Fail", f"{np_pct:.1%} of revenue comes from non-permissible sources (limit is under 5%)."
     elif checked_by == "manual":
@@ -587,6 +694,7 @@ def screen(d):
             reasons.append("Its revenue figures are missing, so interest income can't be checked.")
         if reasons:
             business, why = "Review", f"Needs a manual check. {' '.join(reasons)} {MANUAL_CHECK_TIP}"
+            business_kind = "review"
         else:
             business, why = "Pass", (f"Passed the automatic check: its industry ({d['industry']}) isn't a risky one, "
                                      f"its description mentions nothing non-permissible, and interest income is "
@@ -610,11 +718,19 @@ def screen(d):
     else:
         tier = "Tier 1"
 
-    return {
-        "tier": tier, "business": business, "checked_by": checked_by, "pre_revenue": pre_revenue, "why": why, "ratios": r, "highest": highest,
-        "purge_pct": np_pct or 0.0, "purge_source": np_source,
-        "standards": standards(d, business == "Fail"),
+    income = {"revenue": np_pct, "total": np_total, "source": np_source, "pre_revenue": pre_revenue,
+              "na": None if np_pct is not None else "Revenue figures missing."}
+    if business_kind == "review" and not any(k in industry for k in REVIEW_KEYWORDS) and d["industry"] and \
+            not description_flags(d.get("summary")) and d.get("summary") and (pre_revenue or np_pct is None):
+        business_kind = "pass"   # the only doubt is the income test, which has its own line
+    out = {
+        "tier": tier, "business": business, "business_kind": business_kind, "business_note": business_note,
+        "checked_by": checked_by, "pre_revenue": pre_revenue, "why": why, "ratios": r, "highest": highest,
+        "purge_pct": np_pct or 0.0, "purge_source": np_source, "income": income,
+        "standards": standards(d, business_kind, business_note, income),
     }
+    out["wattlefolio"] = wattlefolio_card(d, out)
+    return out
 
 
 # ----------------------------------------------------------------------------- full ETF holdings files
@@ -1007,27 +1123,42 @@ def pill(text, tier):
     return f'<span class="pill" style="background:{bg};color:{fg}">{html.escape(text)}</span>'
 
 
+MARKS = {"pass": "✓", "fail": "✗", "warn": "!", "watch": "!", "na": "–"}
+
+
 def cards(items):
-    """items: [(title, pill_html, subtitle, [(label, value_html, bad)])] -> grid of cards (1 column on phones)."""
+    """items: [(title, pill_html, subtitle_html, [(label, value_html, status)])] -> grid of cards (1 column on phones).
+
+    status: True/"fail" (red ✗), "pass" (✓), "warn"/"watch" (amber !), "na" (–), False/"" (no mark)."""
     out = []
     for title, badge, sub, lines in items:
-        rows = "".join(f'<div class="line{" bad" if bad else ""}"><span>{label}</span><span>{value}</span></div>'
-                       for label, value, bad in lines)
+        rows = []
+        for label, value, status in lines:
+            status = "fail" if status is True else ("" if status is False else status)
+            mark = f'<i class="mk {status}">{MARKS[status]}</i>' if status in MARKS else ""
+            rows.append(f'<div class="line {status}"><span>{mark}{label}</span><span>{value}</span></div>')
+        rows = "".join(rows)
         out.append(f'<div class="card"><div class="head"><span>{title}</span>{badge}</div>'
                    f'<div class="sub">{sub}</div>{rows}</div>')
     st.markdown(f'<div class="cards">{"".join(out)}</div>', unsafe_allow_html=True)
 
 
+RESULT_TIER = {"Pass": "Tier 1", "Fail": "Tier 3", "Needs a look": "Tier 2"}
+
+
 def standards_table(s):
-    def pct(v):
-        return "–" if v is None else f"{v:.1%}"
-    cards([(name, pill(result, "Tier 1" if result == "Pass" else "Tier 3" if result.startswith("Fail") else "Incomplete"), f"vs {basis}",
-            [(t, f"{pct(v)} <small>/ max {limit * 100:g}%</small>", v is not None and v > limit) for t, v, limit in tests])
-           for name, (basis, tests, result) in s["standards"].items()])
-    st.caption("For comparison only: the colour above follows the WattleFolio rules. "
-               "Every standard also needs under 5% non-permissible revenue. "
-               "\"Cash\" here is all of the company's cash; the standards only count interest-earning cash, "
-               "so cash-rich companies can look worse than they really are.")
+    items = [("WattleFolio rules", pill(s["wattlefolio"]["result"], s["tier"]),
+              f'vs {s["wattlefolio"]["basis"]}<div class="why">{html.escape(s["wattlefolio"]["summary"])}</div>',
+              s["wattlefolio"]["tests"])]
+    items += [(name, pill(x["result"], RESULT_TIER.get(x["result"], "Incomplete")),
+               f'vs {x["basis"]}<div class="why">{html.escape(x["summary"])}</div>', x["tests"])
+              for name, x in s["standards"].items()]
+    cards(items)
+    st.caption("✓ passes · ✗ fails · ! needs a look · – figure missing. The income test is non-permissible income, which must be under 5%. The verdict at the top follows the WattleFolio "
+               "rules; the other standards are for comparison. Non-permissible income is estimated from interest "
+               "income unless a figure is in the review list; AAOIFI measures it against total income (revenue plus "
+               "interest), the others against revenue. \"Cash\" is all of the company's cash; the standards only count "
+               "interest-earning cash, so cash-rich companies can look worse than they really are.")
 
 
 def mix_bar(s):
@@ -1496,7 +1627,7 @@ def show_result(symbol, place, key):
 
         with st.expander("More detail"):
             by = f" ({s['checked_by']})" if s["business"] != "Review" else ""
-            st.write(f"Business check: **{s['business']}{by}**. {s['why'] if s['business'] != 'Fail' else ''}")
+            st.write(f"Business check: **{s['business']}{by}**. {s['why']}")
             ccy_note = f"{d['fin_ccy']} (assumed)" if d.get("fin_ccy_assumed") else d["fin_ccy"]
             st.write(f"Industry: {d['industry'] or 'not provided by Yahoo'} · Accounts reported in {ccy_note}")
             fc = d["fin_ccy"]
