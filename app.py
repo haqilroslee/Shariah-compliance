@@ -7,6 +7,7 @@ import base64
 import csv
 import html
 import io
+import json
 import math
 import os
 import urllib.request
@@ -192,6 +193,7 @@ html, body, .stApp, .stApp p, .stApp li, .stApp input, .stApp button, .stApp lab
 .vbar i { position: absolute; top: -2px; bottom: -2px; width: 3px; margin-left: -1px; background: var(--wf-ink); border-radius: 2px; }
 .vlegend { display: flex; flex-wrap: wrap; gap: 0.2rem 1rem; font-size: 0.88rem; color: var(--wf-muted); }
 .vlegend b { color: var(--wf-ink); }
+[class*="st-key-js_"] { position: absolute; width: 1px; height: 1px; overflow: hidden; opacity: 0; pointer-events: none; }
 .links { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: -0.4rem 0 1.1rem; }
 .links a { display: inline-block; padding: 0.3rem 0.75rem; border: 1px solid var(--wf-line); border-radius: 999px;
            background: var(--wf-surface); color: var(--wf-primary) !important; font-size: 0.85rem; font-weight: 600;
@@ -1616,8 +1618,13 @@ _ccy_options = ["Original currency"] + DISPLAY_CURRENCIES
 _ccy_saved = st.query_params.get("ccy", "")
 if "ccy_choice" not in st.session_state:   # first visit: start from the currency saved in the link
     st.session_state["ccy_choice"] = _ccy_saved if _ccy_saved in DISPLAY_CURRENCIES else "Original currency"
-_ccy = st.selectbox("Show prices in", _ccy_options, key="ccy_choice",
-                    help="Converts prices and values using Yahoo Finance exchange rates. Saved in this page's link.")
+with st.container(key="pair_top"):
+    _c1, _c2 = st.columns([3, 1.4], vertical_alignment="bottom")
+    _ccy = _c1.selectbox("Show prices in", _ccy_options, key="ccy_choice",
+                         help="Converts prices and values using Yahoo Finance exchange rates.")
+    _c2.button("↻ Reload app", width="stretch", on_click=lambda: st.session_state.update(_reload=True),
+               help="Reload to get the latest version of the app. Your watchlist, holdings and settings are kept: "
+                    "they're saved on this device.")
 st.session_state["display_ccy"] = _ccy if _ccy in DISPLAY_CURRENCIES else None
 if (_ccy if _ccy in DISPLAY_CURRENCIES else "") != _ccy_saved:
     if _ccy in DISPLAY_CURRENCIES:
@@ -1684,6 +1691,64 @@ def open_check(place, symbol, name):
     st.session_state[f"last_opened_{place}"] = symbol
 
 
+def run_js(script, key=None):
+    """Run a fixed script written in this file (never user content) in a hidden frame next to the app."""
+    with st.container(key=f"js_{key}" if key else None):
+        if hasattr(st, "iframe"):
+            st.iframe(script, height=1)
+        else:
+            components.html(script, height=0)
+
+
+def run_in_app(js, key):
+    """Run fixed code in the app page itself (the hidden frame may not navigate or reload the page)."""
+    run_js("<script>(function () { const d = window.parent.document, s = d.createElement('script'); "
+           f"s.textContent = {json.dumps(js)}; d.body.appendChild(s); }})();</script>", key=key)
+
+
+# Watchlist, holdings and settings live in the link (?w= ?h= ?ccy= ?etf=). A home-screen shortcut keeps the link it
+# was saved with, so changes are also kept on the device and the newest version (by the ?t= time stamp) wins.
+DEVICE_KEYS = ["h", "w", "ccy", "etf"]
+DEVICE_JS = """
+(function () {
+  const KEY = "wattlefolio-shariah-state", KEYS = %(keys)s;
+  const app = window, url = %(state)s, urlT = %(t)d;
+  let saved = null;
+  try { saved = JSON.parse(app.localStorage.getItem(KEY) || "null"); } catch (e) {}
+  const savedT = saved ? Number(saved.t) || 0 : 0;
+  if (saved && savedT > urlT && !app.sessionStorage.getItem("wf-restored")) {
+    app.sessionStorage.setItem("wf-restored", "1");   // restore once per visit, never loop
+    const q = new URLSearchParams(app.location.search);
+    KEYS.concat(["t"]).forEach(k => q.delete(k));
+    Object.entries(saved.params || {}).forEach(([k, v]) => q.set(k, v));
+    q.set("t", String(savedT));
+    app.location.search = q.toString();
+    return;
+  }
+  if (urlT >= savedT) {
+    try { app.localStorage.setItem(KEY, JSON.stringify({t: urlT, params: url})); } catch (e) {}
+  }
+})();
+"""
+RELOAD_JS = "try { window.top.location.reload(); } catch (e) { window.location.reload(); }"
+
+
+def keep_on_device():
+    """Time-stamp the link when the watchlist, holdings or settings change, and save it on this device."""
+    state = {k: st.query_params[k] for k in DEVICE_KEYS if st.query_params.get(k)}
+    previous = st.session_state.get("_device_state")
+    if previous is not None and state != previous:
+        st.query_params["t"] = str(int(time.time()))
+    st.session_state["_device_state"] = state
+    try:
+        t = int(st.query_params.get("t", "0"))
+    except ValueError:
+        t = 0
+    run_in_app(DEVICE_JS % {"keys": json.dumps(DEVICE_KEYS), "state": json.dumps(state), "t": t}, key="device")
+    if st.session_state.pop("_reload", False):
+        run_in_app(RELOAD_JS, key="reload")
+
+
 SCROLL_TOP_JS = """<script>
   const doc = window.parent.document;
   for (const el of [doc.querySelector('[data-testid="stMain"]'), doc.querySelector('section.main'),
@@ -1692,10 +1757,7 @@ SCROLL_TOP_JS = """<script>
 
 
 def scroll_to_top():
-    if hasattr(st, "iframe"):   # fixed script written here, never user content
-        st.iframe(SCROLL_TOP_JS, height=1)
-    else:
-        components.html(SCROLL_TOP_JS, height=0)
+    run_js(SCROLL_TOP_JS)
 
 
 def navigated(place, home):
@@ -1950,8 +2012,8 @@ def refresh_watchlist(symbols):
 
 
 def watchlist_tab():
-    st.write("A quick overview of the shares and ETFs you're keeping an eye on. Your watchlist is saved in this "
-             "page's link, so bookmark it or add it to your home screen.")
+    st.write("A quick overview of the shares and ETFs you're keeping an eye on. Your watchlist is saved on this "
+             "device and in the page link, so it's there next time.")
     c1, c2 = st.columns([3, 1], vertical_alignment="bottom")
     c1.text_input("Add a share or ETF code", placeholder="e.g. BHP.AX, AAPL, SPY", key="watch_add",
                   on_change=add_typed_code)
@@ -2039,8 +2101,8 @@ with tab_watch:
         watchlist_tab()
 
 with tab_mine:
-    st.write("Your holdings are saved in this page's link. After making changes, bookmark the page "
-             "or add it to your home screen so they're there next time.")
+    st.write("Your holdings are saved on this device and in the page link, so they're there next time, "
+             "including when you open the app from your home screen.")
     holdings = read_holdings()
     with st.expander("Edit my holdings", expanded=holdings.empty):
         edited = st.data_editor(
@@ -2206,6 +2268,12 @@ year, so no ratio mixes figures from different reports. Each stock shows the dat
 the company's annual reports (ASX announcements, SEC 10-K filings or Bursa Malaysia announcements), its website,
 and a search for its latest annual report, so you can check the figures yourself.
 
+**Saving on your phone.** Your watchlist, holdings, currency and ETF setting are kept in the page link and also
+saved on this device, so opening the app from a home-screen shortcut brings back your latest changes. A newer link
+(for example one someone sends you) replaces what's saved. Tap **↻ Reload app** to get the latest version of the app.
+
 Figures can be delayed or incomplete. This app is a calculator,
 not a fatwa or financial advice. Check with a scholar you trust.
 """)
+
+keep_on_device()

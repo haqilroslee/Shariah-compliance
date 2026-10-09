@@ -94,6 +94,12 @@ margin-of-safety price 25% below. Zones: below the margin-of-safety price, below
 Assumptions (`DISCOUNT_RATE`, `TERMINAL_GROWTH`, `GROWTH_CAP`, `GRAHAM_BOND_YIELD`, `MARGIN_OF_SAFETY`,
 `NEAR_VALUE_BAND`) are at the top of `app.py`. It's a rough formula-based guide, not a recommendation.
 
+## Saving on your phone and reloading
+The watchlist, holdings, currency and ETF setting are kept in the link and also saved on the device (browser
+storage), with a time stamp (`?t=`). A home-screen shortcut keeps the link it was saved with, so on opening the app
+restores the newer saved version; a newer link (e.g. one someone sends) replaces what's saved. **↻ Reload app** (top
+right) reloads the page to pick up the latest version of the app without losing anything.
+
 ## Prices and currency
 Each result shows key figures (price and today's change, market value or fund size and fees, P/E, dividend
 yield, 52-week range, 1-year change). **Show prices in** at the top converts prices, values, zakat and dividend
