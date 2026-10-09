@@ -181,6 +181,9 @@ html, body, .stApp, .stApp p, .stApp li, .stApp input, .stApp button, .stApp lab
 [class*="st-key-pair_"] [data-testid="stColumn"] { min-width: 0 !important; width: auto !important; flex: 1 1 0 !important; }
 .wtop small { color: var(--wf-muted); margin-left: 0.2rem; }
 .wprice { font-size: 1.05rem; font-weight: 700; margin: 0.25rem 0 0.2rem; }
+.wvalue { display: flex; flex-wrap: wrap; align-items: center; gap: 0.3rem 0.5rem; font-size: 0.85rem;
+          margin: 0.1rem 0 0.35rem; }
+.wvalue .pill { white-space: normal; }
 .wsub { font-size: 0.82rem; color: var(--wf-muted); line-height: 1.45; }
 .wsub b { color: var(--wf-ink); font-weight: 600; }
 .vcheck { margin: 0.2rem 0 0.4rem; }
@@ -2009,10 +2012,19 @@ def watchlist_tab():
             change = f' <span class="{"up" if pct >= 0 else "down"}">{pct:+.2%}</span>'
         used, checked, old = based_on(d, s)
         warn = '<div class="wsub down">Some figures are over a year old</div>' if old else ""
+        value_line = ""
+        if d["kind"] == "stock":   # price check, as on the full result
+            v = valuation(d)
+            if v["fair"]:
+                value_line = (f'<div class="wvalue">{pill(v["zone"], VALUE_ZONES[v["zone"]])}'
+                              f'<span>Est. value {price_text(v["fair"], d["price_ccy"])} '
+                              f'({d["price"] / v["fair"] - 1:+.0%})</span></div>')
+            else:
+                value_line = '<div class="wsub">Price check: not enough data to estimate a value</div>'
         st.markdown(
             f'<div class="wcard"><div class="wtop"><span><b>{html.escape(name_code(d["name"], d["symbol"]))}</b>'
             f'</span>{pill(status, s["tier"])}</div>'
-            f'<div class="wprice">{price_text(d["price"], d["price_ccy"])}{change}</div>'
+            f'<div class="wprice">{price_text(d["price"], d["price_ccy"])}{change}</div>{value_line}'
             f'<div class="wsub"><b>Based on:</b> {html.escape(used)}</div>'
             f'<div class="wsub">{html.escape(checked)}</div>{warn}</div>', unsafe_allow_html=True)
         with st.container(key=f"pair_wl_{sym}"):
@@ -2157,7 +2169,8 @@ recommendations. The list is worked out once a day, so the first search of the d
 **8. Watchlist.** Add any share or ETF with **☆ Add to watchlist** on its result, **☆ Watch** in Find, or by
 typing its code in the Watchlist tab. Each one shows whether it's compliant, its price, and what the result is
 based on: the annual report and balance sheet dates (or where an ETF's holdings came from) and when WattleFolio
-last checked it. Tap **↻ Refresh** to fetch the latest data for everything on it (once a minute at most).
+last checked it, and for companies the Price check zone and estimated value. Tap **↻ Refresh** to fetch the latest
+data for everything on it (once a minute at most).
 Your watchlist is saved in the page link.
 
 **9. Price check.** For companies, the current price is compared with an estimated value from formulas
