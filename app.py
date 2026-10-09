@@ -63,6 +63,13 @@ IDEAS_CANDIDATES = 100    # how many of the largest companies to screen (more = 
 IDEAS_SHOW = 50
 IDEAS_SKIP_SECTORS = ["Financial Services"]   # mostly banks and insurers, so not worth screening
 IDEAS_ETF_CANDIDATES = 60   # largest ETFs per market to look through (each one checks ~10 holdings)
+# Price check against estimated value (formulas value investors use). Rough guides, not recommendations.
+DISCOUNT_RATE = 0.09        # return an investor wants each year, used to discount future cash flows and dividends
+TERMINAL_GROWTH = 0.025     # long-run growth after the first 5 years (about inflation)
+GROWTH_CAP = 0.15           # never assume more than 15% a year growth (Graham's caution)
+GRAHAM_BOND_YIELD = 5.0     # Graham's formula benchmark: high-grade corporate bond yield, %
+MARGIN_OF_SAFETY = 0.25     # margin-of-safety price = 25% below the estimated value
+NEAR_VALUE_BAND = 0.20      # up to 20% above the estimated value counts as "near"
 # "Show prices in" choices; the choice is kept in the page link (?ccy=AUD)
 DISPLAY_CURRENCIES = ["AUD", "USD", "SGD", "MYR", "GBP", "EUR", "NZD", "HKD", "CAD", "JPY", "IDR"]
 MARKET_SUFFIX = {"au": ".AX", "my": ".KL", "us": ""}   # Yahoo code endings, to keep name-search hits in the market
@@ -176,6 +183,12 @@ html, body, .stApp, .stApp p, .stApp li, .stApp input, .stApp button, .stApp lab
 .wprice { font-size: 1.05rem; font-weight: 700; margin: 0.25rem 0 0.2rem; }
 .wsub { font-size: 0.82rem; color: var(--wf-muted); line-height: 1.45; }
 .wsub b { color: var(--wf-ink); font-weight: 600; }
+.vcheck { margin: 0.2rem 0 0.4rem; }
+.vbar { position: relative; height: 14px; border-radius: 7px; overflow: hidden; background: var(--wf-bar); margin: 0.7rem 0 0.5rem; }
+.vbar div { position: absolute; top: 0; bottom: 0; }
+.vbar i { position: absolute; top: -2px; bottom: -2px; width: 3px; margin-left: -1px; background: var(--wf-ink); border-radius: 2px; }
+.vlegend { display: flex; flex-wrap: wrap; gap: 0.2rem 1rem; font-size: 0.88rem; color: var(--wf-muted); }
+.vlegend b { color: var(--wf-ink); }
 .links { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: -0.4rem 0 1.1rem; }
 .links a { display: inline-block; padding: 0.3rem 0.75rem; border: 1px solid var(--wf-line); border-radius: 999px;
            background: var(--wf-surface); color: var(--wf-primary) !important; font-size: 0.85rem; font-weight: 600;
@@ -449,6 +462,12 @@ def fetch(symbol):
         "website": info.get("website") or "",
         "exchange_name": info.get("fullExchangeName") or info.get("exchange") or "",
         "pe": info.get("trailingPE"),
+        "pb": info.get("priceToBook"),
+        "fcf": info.get("freeCashflow"),
+        "earnings_growth": info.get("earningsGrowth"),
+        "revenue_growth": info.get("revenueGrowth"),
+        "target_mean": (info.get("targetMeanPrice") or 0) / divisor or None,
+        "analysts": info.get("numberOfAnalystOpinions") or 0,
         "market_cap_quote": info.get("marketCap"),
         "low_52w": (info.get("fiftyTwoWeekLow") or 0) / divisor or None,
         "high_52w": (info.get("fiftyTwoWeekHigh") or 0) / divisor or None,
@@ -1083,6 +1102,138 @@ def key_figures(d):
                    f"(Yahoo Finance, refreshed hourly). Ratios are the same in any currency.")
 
 
+def valuation(d):
+    """Estimated value per share from classic formulas, in the share price's currency.
+
+    Per-share earnings and book value come from Yahoo's price ratios (price ÷ P/E, price ÷ P/B) so they're in the
+    same currency as the price. Returns {"methods": [{name, formula, inputs, value, note}], "fair", "safe", "zone",
+    "growth", "growth_source", "spread"}."""
+    price = d["price"]
+    eps = price / d["pe"] if d.get("pe") and d["pe"] > 0 else None
+    bvps = price / d["pb"] if d.get("pb") and d["pb"] > 0 else None
+    raw_g, g_src = None, ""
+    if d.get("earnings_growth") is not None:
+        raw_g, g_src = d["earnings_growth"], "earnings growth over the last year"
+    elif d.get("revenue_growth") is not None:
+        raw_g, g_src = d["revenue_growth"], "sales growth over the last year"
+    g = None if raw_g is None else max(0.0, min(raw_g, GROWTH_CAP))
+    r, tg = DISCOUNT_RATE, TERMINAL_GROWTH
+    fcf_ps = None
+    if d.get("fcf") and d.get("shares"):
+        fcf_ps = d["fcf"] / (d["conv"] * d["divisor"]) / d["shares"]   # report currency -> price currency, per share
+    dps = d.get("dps_12m") or 0.0
+    ccy = d["price_ccy"]
+
+    def money_ps(x):
+        return f"{x:,.2f} {ccy}"
+
+    methods = []
+    # 1. Graham Number
+    if eps and eps > 0 and bvps and bvps > 0:
+        methods.append({"name": "Graham Number", "formula": "√(22.5 × earnings per share × book value per share)",
+                        "inputs": f"EPS {money_ps(eps)} · book value {money_ps(bvps)} a share",
+                        "value": math.sqrt(22.5 * eps * bvps)})
+    else:
+        methods.append({"name": "Graham Number", "value": None,
+                        "note": "Needs positive earnings and book value."})
+    # 2. Graham growth formula
+    if eps and eps > 0 and g is not None:
+        methods.append({"name": "Graham growth formula",
+                        "formula": f"EPS × (8.5 + 2 × growth%) × 4.4 ÷ bond yield ({GRAHAM_BOND_YIELD:g}%)",
+                        "inputs": f"EPS {money_ps(eps)} · growth {g:.1%}",
+                        "value": eps * (8.5 + 2 * g * 100) * 4.4 / GRAHAM_BOND_YIELD})
+    else:
+        methods.append({"name": "Graham growth formula", "value": None,
+                        "note": "Needs positive earnings and a growth figure."})
+    # 3. Discounted cash flow
+    if fcf_ps and fcf_ps > 0 and g is not None:
+        flows = [fcf_ps * (1 + g) ** t / (1 + r) ** t for t in range(1, 6)]
+        terminal = fcf_ps * (1 + g) ** 5 * (1 + tg) / (r - tg) / (1 + r) ** 5
+        methods.append({"name": "Discounted cash flow",
+                        "formula": f"5 years of free cash flow growing {g:.1%}, then {tg:.1%} a year, discounted at {r:.0%}",
+                        "inputs": f"free cash flow {money_ps(fcf_ps)} a share",
+                        "value": sum(flows) + terminal})
+    else:
+        methods.append({"name": "Discounted cash flow", "value": None,
+                        "note": "Needs positive free cash flow and a growth figure."})
+    # 4. Dividend discount (Gordon growth)
+    gd = min(g if g is not None else 0.03, 0.05)
+    if dps > 0 and r > gd:
+        methods.append({"name": "Dividend discount",
+                        "formula": f"next year's dividend ÷ ({r:.0%} − dividend growth {gd:.1%})",
+                        "inputs": f"dividend {money_ps(dps)} a share over the last 12 months",
+                        "value": dps * (1 + gd) / (r - gd)})
+    else:
+        methods.append({"name": "Dividend discount", "value": None, "note": "Only for companies that pay dividends."})
+
+    values = sorted(m["value"] for m in methods if m.get("value"))
+    out = {"methods": methods, "growth": g, "growth_source": g_src, "raw_growth": raw_g, "fair": None}
+    if values:
+        mid = len(values) // 2
+        fair = values[mid] if len(values) % 2 else (values[mid - 1] + values[mid]) / 2
+        safe = fair * (1 - MARGIN_OF_SAFETY)
+        zone = ("Below the margin-of-safety price" if price <= safe else "Below estimated value" if price <= fair
+                else "Near estimated value" if price <= fair * (1 + NEAR_VALUE_BAND) else "Above estimated value")
+        out.update(fair=fair, safe=safe, zone=zone, count=len(values),
+                   spread=values[-1] / values[0] if values[0] > 0 else None)
+    return out
+
+
+VALUE_ZONES = {"Below the margin-of-safety price": "Tier 1", "Below estimated value": "Tier 1",
+               "Near estimated value": "Tier 2", "Above estimated value": "Tier 3"}
+
+
+def price_check(d, s):
+    """The "Price check" section: current price against value estimates from classic formulas."""
+    st.subheader("Price check")
+    v = valuation(d)
+    if s["tier"] == "Tier 3":
+        st.caption("This company doesn't meet the WattleFolio rules, so this is shown for information only.")
+    if not v["fair"]:
+        st.write("There isn't enough data from Yahoo Finance (earnings, book value, cash flow or dividends) to "
+                 "estimate a value for this company.")
+        return
+    price, fair, safe = d["price"], v["fair"], v["safe"]
+    top = max(price, fair * (1 + NEAR_VALUE_BAND)) * 1.15
+
+    def pos(x):
+        return min(max(x / top * 100, 0), 100)
+    segs = [(0, safe, "var(--wf-good)"), (safe, fair, "var(--wf-t1-bg)"), (fair, fair * (1 + NEAR_VALUE_BAND), "var(--wf-watch)"),
+            (fair * (1 + NEAR_VALUE_BAND), top, "var(--wf-bad)")]
+    bar = "".join(f'<div style="left:{pos(a):.2f}%;width:{pos(b) - pos(a):.2f}%;background:{c}"></div>' for a, b, c in segs)
+    st.markdown(
+        f'<div class="vcheck">{pill(v["zone"], VALUE_ZONES[v["zone"]])}'
+        f'<div class="vbar">{bar}<i style="left:{pos(price):.2f}%"></i></div>'
+        f'<div class="vlegend"><span>Margin-of-safety price <b>{price_text(safe, d["price_ccy"])}</b></span>'
+        f'<span>Estimated value <b>{price_text(fair, d["price_ccy"])}</b></span>'
+        f'<span>Price now <b>{price_text(price, d["price_ccy"])}</b> ({price / fair - 1:+.0%} vs estimate)</span></div>'
+        f'</div>', unsafe_allow_html=True)
+    notes = [f"Estimated value is the middle of {v['count']} method{'s' if v['count'] != 1 else ''} below; the "
+             f"margin-of-safety price is {MARGIN_OF_SAFETY:.0%} under it."]
+    if v.get("spread") and v["spread"] > 3:
+        notes.append("The methods disagree a lot, so treat this as very rough. Fast-growing companies often look "
+                     "expensive on these formulas.")
+    if v["raw_growth"] is not None and v["raw_growth"] > GROWTH_CAP:
+        notes.append(f"Growth was {v['raw_growth']:.0%} but is capped at {GROWTH_CAP:.0%} a year, as Graham advised.")
+    st.caption(" ".join(notes) + " A rough guide from formulas, not a recommendation to buy or sell.")
+    with st.expander("How the estimates are worked out"):
+        rows = []
+        for m in v["methods"]:
+            if m.get("value"):
+                rows.append(f'- **{m["name"]}: {price_text(m["value"], d["price_ccy"])}**  \n'
+                            f'  {m["formula"]}. Using {m["inputs"]}.')
+            else:
+                rows.append(f'- **{m["name"]}:** not used. {m["note"]}')
+        if d.get("target_mean") and d.get("analysts", 0) >= 3:
+            rows.append(f'- *For reference:* the average target of {d["analysts"]} analysts is '
+                        f'{price_text(d["target_mean"], d["price_ccy"])} (not part of the estimate).')
+        st.markdown("\n".join(rows))
+        st.caption(f"Assumptions: {DISCOUNT_RATE:.0%} discount rate, {TERMINAL_GROWTH:.1%} long-run growth, growth "
+                   f"capped at {GROWTH_CAP:.0%} ({v['growth_source'] or 'no growth figure available'}), "
+                   f"{MARGIN_OF_SAFETY:.0%} margin of safety. Earnings, book value, free cash flow and growth come "
+                   f"from Yahoo Finance. Change them at the top of app.py.")
+
+
 def research_buttons(d):
     st.markdown('<div class="links">' + "".join(
         f'<a href="{html.escape(url, quote=True)}" target="_blank" rel="noopener">{html.escape(label)} ↗</a>'
@@ -1625,6 +1776,8 @@ def show_result(symbol, place, key):
             st.caption("This is high because the company has almost no sales yet, so most of its income is "
                        "interest on its cash. Companies at this stage rarely pay dividends.")
 
+        price_check(d, s)
+
         with st.expander("More detail"):
             by = f" ({s['checked_by']})" if s["business"] != "Review" else ""
             st.write(f"Business check: **{s['business']}{by}**. {s['why']}")
@@ -2006,6 +2159,12 @@ typing its code in the Watchlist tab. Each one shows whether it's compliant, its
 based on: the annual report and balance sheet dates (or where an ETF's holdings came from) and when WattleFolio
 last checked it. Tap **↻ Refresh** to fetch the latest data for everything on it (once a minute at most).
 Your watchlist is saved in the page link.
+
+**9. Price check.** For companies, the current price is compared with an estimated value from formulas
+value investors use: the Graham Number, Graham's growth formula, a discounted cash flow, and (for dividend payers)
+a dividend discount model. The estimated value is the middle of those that have enough data, and the
+margin-of-safety price is 25% below it. Every formula and input is shown. These are rough guides that can be far
+off for fast-growing companies, not recommendations to buy or sell.
 
 **How the WattleFolio rules compare with the main standards.** Our rules are closest to Dow Jones Islamic
 (same 2-year average), but stricter: on-watch starts at 30%. Each stock's
