@@ -1709,28 +1709,57 @@ def run_in_app(js, key):
 # Watchlist, holdings and settings live in the link (?w= ?h= ?ccy= ?etf=). A home-screen shortcut keeps the link it
 # was saved with, so changes are also kept on the device and the newest version (by the ?t= time stamp) wins.
 DEVICE_KEYS = ["h", "w", "ccy", "etf"]
+# Shared by the device and reload scripts. On Streamlit Cloud the app sits in a frame inside Streamlit's own page;
+# the address that matters (home-screen shortcut, reload, copied link) is that outer page's, so update that one.
+GO_JS = """
+  const KEYS = %(keys)s;
+  function outer() {   // the outer page's address when it's on the same site, else this frame's
+    try { const l = window.top.location; void l.pathname; return l; } catch (e) { return window.location; }
+  }
+  function query(base, params, t) {
+    const q = new URLSearchParams(base);
+    KEYS.concat(["t"]).forEach(k => q.delete(k));
+    Object.entries(params || {}).forEach(([k, v]) => q.set(k, v));
+    if (t) q.set("t", String(t));
+    return q.toString();
+  }
+  function go(params, t) {   // load the app with this watchlist, holdings and settings
+    const o = outer();
+    o.replace(o.pathname + "?" + query(o.search, params, t));
+  }
+"""
 DEVICE_JS = """
 (function () {
-  const KEY = "wattlefolio-shariah-state", KEYS = %(keys)s;
-  const app = window, url = %(state)s, urlT = %(t)d;
+  const KEY = "wattlefolio-shariah-state", url = %(state)s, urlT = %(t)d;
+""" + GO_JS + """
   let saved = null;
-  try { saved = JSON.parse(app.localStorage.getItem(KEY) || "null"); } catch (e) {}
+  try { saved = JSON.parse(localStorage.getItem(KEY) || "null"); } catch (e) {}
   const savedT = saved ? Number(saved.t) || 0 : 0;
-  if (saved && savedT > urlT && !app.sessionStorage.getItem("wf-restored")) {
-    app.sessionStorage.setItem("wf-restored", "1");   // restore once per visit, never loop
-    const q = new URLSearchParams(app.location.search);
-    KEYS.concat(["t"]).forEach(k => q.delete(k));
-    Object.entries(saved.params || {}).forEach(([k, v]) => q.set(k, v));
-    q.set("t", String(savedT));
-    app.location.search = q.toString();
-    return;
+  if (saved && savedT > urlT) {   // this address is older than what's saved here: bring back the saved version
+    const last = Number(sessionStorage.getItem("wf-restore-at") || 0);
+    if (Date.now() - last > 15000) {   // short cool-down instead of once per visit, so a reload restores too
+      sessionStorage.setItem("wf-restore-at", String(Date.now()));
+      go(saved.params, savedT);
+    }
+    return;   // never let an older address overwrite the newer saved version
   }
-  if (urlT >= savedT) {
-    try { app.localStorage.setItem(KEY, JSON.stringify({t: urlT, params: url})); } catch (e) {}
+  try { localStorage.setItem(KEY, JSON.stringify({t: urlT, params: url})); } catch (e) {}
+  const o = outer();   // keep the outer address in step, so a reload or copied link has the latest
+  if (o !== window.location) {
+    const want = query(o.search, url, urlT);
+    if (o.search.replace(/^\\?/, "") !== want) {
+      try { window.top.history.replaceState(window.top.history.state, "", o.pathname + "?" + want); } catch (e) {}
+    }
   }
 })();
 """
-RELOAD_JS = "try { window.top.location.reload(); } catch (e) { window.location.reload(); }"
+RELOAD_JS = """
+(function () {
+  const params = %(state)s, t = %(t)d;
+""" + GO_JS + """
+  go(params, t);   // reload with the current watchlist, holdings and settings in the address
+})();
+"""
 
 
 def keep_on_device():
@@ -1744,9 +1773,10 @@ def keep_on_device():
         t = int(st.query_params.get("t", "0"))
     except ValueError:
         t = 0
-    run_in_app(DEVICE_JS % {"keys": json.dumps(DEVICE_KEYS), "state": json.dumps(state), "t": t}, key="device")
+    values = {"keys": json.dumps(DEVICE_KEYS), "state": json.dumps(state), "t": t}
+    run_in_app(DEVICE_JS % values, key="device")
     if st.session_state.pop("_reload", False):
-        run_in_app(RELOAD_JS, key="reload")
+        run_in_app(RELOAD_JS % values, key="reload")
 
 
 SCROLL_TOP_JS = """<script>
