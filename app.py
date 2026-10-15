@@ -13,7 +13,7 @@ import os
 import urllib.request
 import re
 import time
-from urllib.parse import quote_plus
+from urllib.parse import parse_qs, quote as url_quote, quote_plus, urlencode, urlparse
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -29,6 +29,7 @@ from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ct
 TIER1_MAX = 0.30          # Tier 1: highest ratio <= 30%
 TIER2_MAX = 0.33          # Tier 2: 30.1% - 33%; above = Tier 3
 REVENUE_LIMIT = 0.05      # non-permissible revenue must be below 5%
+INCOME_BORDER = 0.005     # an estimate within 0.5 points of the 5% limit (4.5-5.5%) needs a manual check
 PRE_REVENUE_SHARE = 0.5   # interest above this share of revenue = no real sales yet (explorers, biotechs): manual check, not auto-fail
 STALE_DAYS = 450          # warn when the latest company figures are older than this
 EXIT_DAYS = 60            # orderly liquidation window for Tier 3
@@ -187,6 +188,10 @@ html, body, .stApp, .stApp p, .stApp li, .stApp input, .stApp button, .stApp lab
 .wvalue .pill { white-space: normal; }
 .wsub { font-size: 0.82rem; color: var(--wf-muted); line-height: 1.45; }
 .wsub b { color: var(--wf-ink); font-weight: 600; }
+.wcard.changed { border: 2px solid var(--wf-watch); }
+.wchange { background: var(--wf-note-bg); border-left: 4px solid var(--wf-note-line); border-radius: 4px;
+           padding: 0.3rem 0.6rem; margin: 0.45rem 0 0.2rem; font-size: 0.88rem; }
+.pill.changed { background: var(--wf-primary); color: var(--wf-surface); }
 .vcheck { margin: 0.2rem 0 0.4rem; }
 .vbar { position: relative; height: 14px; border-radius: 7px; overflow: hidden; background: var(--wf-bar); margin: 0.7rem 0 0.5rem; }
 .vbar div { position: absolute; top: 0; bottom: 0; }
@@ -410,6 +415,34 @@ def income_figures(df):
     return None
 
 
+def next_results(info, bs_date, symbol):
+    """When the company's next results are due: {"date", "rough"}. Yahoo's date when it has one, otherwise a rough
+    guess from the reporting cycle: US and Bursa companies report quarterly, most others half-yearly, about
+    5 weeks (US) or 2 months after the period ends."""
+    now = time.time()
+    stamps = [info.get(k) for k in ("earningsTimestampStart", "earningsTimestamp", "earningsTimestampEnd",
+                                    "earningsCallTimestampStart")]
+    future = [x for x in stamps if isinstance(x, (int, float)) and x > now - 86400]
+    if future:
+        return {"date": datetime.fromtimestamp(min(future), APP_TZ).date(), "rough": False}
+    us = "." not in symbol
+    step = pd.DateOffset(months=3 if us or symbol.upper().endswith(".KL") else 6)
+    lag = pd.DateOffset(days=35) if us else pd.DateOffset(months=2)
+    end, today = pd.Timestamp(bs_date).tz_localize(None).normalize(), pd.Timestamp(date.today())
+    for _ in range(12):
+        end += step
+        if end + lag > today:
+            return {"date": (end + lag).date(), "rough": True}
+    return None
+
+
+def results_text(nr):
+    """'due 17 Feb 2027' / 'expected around Feb 2027', or '' when unknown."""
+    if not nr:
+        return ""
+    return f"expected around {nr['date']:%b %Y}" if nr["rough"] else f"due {nr['date']:%d %b %Y}"
+
+
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def fetch(symbol):
     info, profile_ok = company_info(symbol)
@@ -505,6 +538,7 @@ def fetch(symbol):
         "inc_label": (f"FY{inc['date'].year} annual report (year to {inc['date']:%d %b %Y})" if inc
                       else "not available"),
         "bs_days": days_old(bs["date"]),
+        "next_results": next_results(info, bs["date"], symbol),
         "inc_days": days_old(inc["date"]) if inc else 0,
     }
 
@@ -544,6 +578,14 @@ def _limit_test(label, value, limit):
     return (label, f"{_pct(value)} <small>/ max {limit * 100:g}%</small>", "pass" if value <= limit else "fail")
 
 
+def near_limit(v):
+    """An estimated income share close enough to the 5% limit that the estimate can't decide it."""
+    return v is not None and REVENUE_LIMIT - INCOME_BORDER <= v < REVENUE_LIMIT + INCOME_BORDER
+
+
+BORDER_PHRASE = "the income figure is right at the 5% limit, so it needs a check in the annual report"
+
+
 def _plain(value_html):
     t = re.sub(r"<[^>]+>", "", value_html).strip().rstrip(".")
     return t[:1].lower() + t[1:]
@@ -564,8 +606,9 @@ def _summary(tests):
         return why + (f" Passes: {', '.join(passes)}." if passes else "")
     if missing:
         return f"Can't be fully checked: {', '.join(missing)} missing."
-    if warns:
-        return "The numbers pass, but " + " and ".join(WARN_PHRASES.get(t[0], _plain(t[1])) for t in warns) + "."
+    if warns:   # a line can carry its own phrase as a 4th item
+        return "The numbers pass, but " + " and ".join(
+            t[3] if len(t) > 3 else WARN_PHRASES.get(t[0], _plain(t[1])) for t in warns) + "."
     return "Passes every test."
 
 
@@ -573,7 +616,7 @@ def standards(d, business_kind, business_note, income):
     """Each standard's tests as shown in "How other standards see it".
 
     business_kind: excluded / review / pass. income: {"revenue": share of revenue, "total": share of total income,
-    "source": text, "na": reason or None, "pre_revenue": bool}.
+    "source": text, "na": reason or None, "pre_revenue": bool, "borderline": bool}.
     Returns {name: {"basis", "tests": [(label, value_html, status)], "result", "summary"}}."""
     cash_recv = d["cash"] + d["receivables"] if d["cash"] is not None else None
 
@@ -584,6 +627,9 @@ def standards(d, business_kind, business_note, income):
             return ("Income test", income["na"], "na")
         v = income[share_of]
         what = "of total income" if share_of == "total" else "of revenue"
+        if income.get("borderline") and near_limit(v):
+            return ("Income test", f"{_pct(v)} {what} <small>/ under 5% · close to the limit</small>", "warn",
+                    BORDER_PHRASE)
         return ("Income test", f"{_pct(v)} {what} <small>/ under 5%</small>",
                 "pass" if v < REVENUE_LIMIT else "fail")
 
@@ -641,8 +687,13 @@ def wattlefolio_card(d, s):
     elif inc.get("na"):
         tests.append(("Income test", inc["na"], "na"))
     else:
-        tests.append(("Income test", f"{_pct(inc['revenue'])} of revenue <small>/ under 5%</small>",
-                      "pass" if inc["revenue"] < REVENUE_LIMIT else "fail"))
+        total = f" ({_pct(inc['total'])} of total income)" if inc.get("total") is not None else ""
+        if inc.get("borderline"):
+            tests.append(("Income test", f"{_pct(inc['revenue'])} of revenue{total} <small>/ under 5% · close to "
+                                         f"the limit</small>", "warn", BORDER_PHRASE))
+        else:
+            tests.append(("Income test", f"{_pct(inc['revenue'])} of revenue{total} <small>/ under 5%</small>",
+                          "pass" if inc["revenue"] < REVENUE_LIMIT else "fail"))
     if s["business_kind"] == "excluded":
         tests.append(("Business activity", html.escape(s["business_note"]), "fail"))
     elif s["business_kind"] == "review":
@@ -650,7 +701,7 @@ def wattlefolio_card(d, s):
     elif s["business_kind"] == "pass":
         tests.append(("Business activity", "Passes" + (" (checked manually)" if s["checked_by"] == "manual" else
                                                        " (automatic check)"), "pass"))
-    summary = _summary([(t[0], t[1], "warn" if t[2] == "watch" else t[2]) for t in tests])
+    summary = _summary([(t[0], t[1], "warn" if t[2] == "watch" else t[2], *t[3:]) for t in tests])
     if any(t[2] == "watch" for t in tests) and not any(t[2] == "fail" for t in tests):
         summary = "On watch: " + ", ".join(t[0].lower() for t in tests if t[2] == "watch") + \
                   f" is between {TIER1_MAX * 100:g}% and {TIER2_MAX * 100:g}%."
@@ -688,6 +739,12 @@ def screen(d):
     pre_revenue = (np_source.startswith("estimate") and np_pct is not None and np_pct >= PRE_REVENUE_SHARE
                    and not excluded_industry)   # banks earn mostly interest: that's not "no sales yet"
     checked_by = "manual" if review is not None and review["excluded"].strip().lower() in ("yes", "no") else "automatic"
+    # An estimate close to 5% can't decide it either way (the real figure is in the annual report), unless a
+    # decision has been recorded in the review list
+    borderline = (np_source.startswith("estimate") and checked_by == "automatic" and not pre_revenue
+                  and near_limit(np_pct))
+    both = (f"{np_pct:.1%} of revenue" + (f" ({np_total:.1%} of total income)" if np_total is not None else "")
+            if np_pct is not None else "")
     business_kind, business_note = "pass", ""
     if review is not None and review["excluded"].strip().lower() == "yes":
         business, why = "Fail", "Marked as excluded in the WattleFolio review list."
@@ -695,8 +752,8 @@ def screen(d):
     elif review is None and any(k in industry for k in EXCLUDED_KEYWORDS):
         business, why = "Fail", f"Its industry ({d['industry']}) is on the excluded list."
         business_kind, business_note = "excluded", f"Excluded industry: {d['industry']}"
-    elif np_pct is not None and np_pct >= REVENUE_LIMIT and not pre_revenue:
-        business, why = "Fail", f"{np_pct:.1%} of revenue comes from non-permissible sources (limit is under 5%)."
+    elif np_pct is not None and np_pct >= REVENUE_LIMIT and not pre_revenue and not borderline:
+        business, why = "Fail", f"{both} comes from non-permissible sources (limit is under 5%)."
     elif checked_by == "manual":
         business, why = "Pass", "Business activities checked manually (WattleFolio review list)."
     else:
@@ -716,6 +773,10 @@ def screen(d):
                            f"so the 5% revenue test doesn't say much. This is common for explorers and biotechs.")
         if np_pct is None:
             reasons.append("Its revenue figures are missing, so interest income can't be checked.")
+        if borderline:
+            reasons.append(f"Its interest income is {np_pct:.1%} of revenue ({np_total:.1%} of total income, the way "
+                           f"AAOIFI measures it): right at the 5% limit. This is an estimate, so the annual report "
+                           f"decides it.")
         if reasons:
             business, why = "Review", f"Needs a manual check. {' '.join(reasons)} {MANUAL_CHECK_TIP}"
             business_kind = "review"
@@ -743,13 +804,14 @@ def screen(d):
         tier = "Tier 1"
 
     income = {"revenue": np_pct, "total": np_total, "source": np_source, "pre_revenue": pre_revenue,
-              "na": None if np_pct is not None else "Revenue figures missing."}
+              "borderline": borderline, "na": None if np_pct is not None else "Revenue figures missing."}
     if business_kind == "review" and not any(k in industry for k in REVIEW_KEYWORDS) and d["industry"] and \
-            not description_flags(d.get("summary")) and d.get("summary") and (pre_revenue or np_pct is None):
+            not description_flags(d.get("summary")) and d.get("summary") and \
+            (pre_revenue or np_pct is None or borderline):
         business_kind = "pass"   # the only doubt is the income test, which has its own line
     out = {
         "tier": tier, "business": business, "business_kind": business_kind, "business_note": business_note,
-        "checked_by": checked_by, "pre_revenue": pre_revenue, "why": why, "ratios": r, "highest": highest,
+        "checked_by": checked_by, "pre_revenue": pre_revenue, "borderline": borderline, "why": why, "ratios": r, "highest": highest,
         "purge_pct": np_pct or 0.0, "purge_source": np_source, "income": income,
         "standards": standards(d, business_kind, business_note, income),
     }
@@ -1289,7 +1351,7 @@ def cards(items):
     out = []
     for title, badge, sub, lines in items:
         rows = []
-        for label, value, status in lines:
+        for label, value, status, *_ in lines:
             status = "fail" if status is True else ("" if status is False else status)
             mark = f'<i class="mk {status}">{MARKS[status]}</i>' if status in MARKS else ""
             rows.append(f'<div class="line {status}"><span>{mark}{label}</span><span>{value}</span></div>')
@@ -1453,6 +1515,8 @@ def source_line(d):
     else:
         parts = [f"Price {d['price_date']}", f"balance sheet {d['as_of']}",
                  d["inc_label"].split(" (")[0].replace(" annual report", " revenue")]
+        if results_text(d.get("next_results")):
+            parts.append(f"next results {results_text(d['next_results'])}")
     st.markdown(f'<div class="src">Source: Yahoo Finance · {" · ".join(html.escape(p) for p in parts)}</div>',
                 unsafe_allow_html=True)
 
@@ -1578,6 +1642,7 @@ def write_holdings(df):
             st.query_params["h"] = new
         elif "h" in st.query_params:
             del st.query_params["h"]
+    return new
 
 
 # ----------------------------------------------------------------------------- pages
@@ -1632,19 +1697,38 @@ if (_ccy if _ccy in DISPLAY_CURRENCIES else "") != _ccy_saved:
     elif "ccy" in st.query_params:
         del st.query_params["ccy"]
 
+shared_slot = st.container()   # filled below: the offer to add a list someone shared in a link
 tab_check, tab_ideas, tab_watch, tab_mine, tab_how = st.tabs(["Check", "Find", "Watchlist", "Holdings", "How it works"])
 
 # ----------------------------------------------------------------------------- watchlist (kept in the link as ?w=)
+# Each code is saved with the last result you saw (?w=BHP.AX:C,AAPL:Wm), so a change can be pointed out
+STATUS_NAMES = {"C": "Compliant", "W": "On watch", "N": "Not compliant", "U": "Can't tell yet", "I": "Islamic fund"}
+
+
 def watchlist():
     if "watchlist" not in st.session_state:
-        st.session_state["watchlist"] = [c for c in st.query_params.get("w", "").split(",") if c]
+        codes, seen = [], {}
+        for part in st.query_params.get("w", "").split(","):
+            code, _, status = part.partition(":")
+            if code and code not in codes:
+                codes.append(code)
+                if status[:1] in STATUS_NAMES:
+                    seen[code] = status
+        st.session_state["watchlist"], st.session_state["watch_seen"] = codes, seen
     return st.session_state["watchlist"]
 
 
+def watch_seen():
+    """{code: status code of the result last seen}."""
+    watchlist()
+    return st.session_state["watch_seen"]
+
+
 def save_watchlist():
-    wl = watchlist()
-    if wl:
-        st.query_params["w"] = ",".join(wl)
+    wl, seen = watchlist(), watch_seen()
+    value = ",".join(f"{c}:{seen[c]}" if c in seen else c for c in wl)
+    if value:
+        st.query_params["w"] = value
     elif "w" in st.query_params:
         del st.query_params["w"]
 
@@ -1653,9 +1737,189 @@ def toggle_watch(symbol):
     wl = watchlist()
     if symbol in wl:
         wl.remove(symbol)
+        watch_seen().pop(symbol, None)
     else:
         wl.append(symbol)
     save_watchlist()
+
+
+def watch_status(s):
+    """A short code for a result: C / W / N / U / I, plus "m" when it needs a manual check."""
+    if s.get("islamic"):
+        return "I"
+    return {"Tier 1": "C", "Tier 2": "W", "Tier 3": "N"}.get(s["tier"], "U") + ("m" if s["business"] == "Review" else "")
+
+
+def status_name(code):
+    return STATUS_NAMES.get(code[:1], "Unknown") + (" · needs manual check" if code.endswith("m") else "")
+
+
+def mark_seen(statuses):
+    watch_seen().update(statuses)
+    save_watchlist()
+
+
+# ----------------------------------------------------------------------------- sharing a list in a link
+# A shared link carries ?sw= (watchlist codes) and ?sh= (holdings, as in ?h=). Nothing is added until the person
+# taps Add, and then only what they don't already have, so opening a link never replaces their own list.
+SHARE_KEYS = ["sw", "sh"]
+CODE_RE = re.compile(r"^[A-Z0-9.\-^=]{1,20}$")
+
+
+def clean_codes(raw):
+    """Share codes from a link, upper case, without a saved status, duplicates or anything that isn't a code."""
+    codes = [c.split(":")[0].strip().upper() for c in raw.split(",")]
+    return list(dict.fromkeys(c for c in codes if CODE_RE.match(c)))[:100]
+
+
+def clean_holdings(raw):
+    """Holdings entries from a link ("CODE:shares:dividend:date") that the Holdings tab can read."""
+    out = {}
+    for part in raw.split(";"):
+        bits = part.split(":") + ["", "", ""]
+        code = bits[0].strip().upper()
+        try:
+            float(bits[1] or 0)
+            if bits[2]:
+                float(bits[2])
+            if bits[3]:
+                datetime.strptime(bits[3], "%Y-%m-%d")
+        except ValueError:
+            continue
+        if CODE_RE.match(code) and code not in out:
+            out[code] = ":".join([code] + bits[1:4]).rstrip(":")
+    return list(out.values())[:100]
+
+
+def add_shared(codes, holdings):
+    """Add a shared watchlist and holdings, skipping anything already here. Returns (codes added, holdings added)."""
+    wl = watchlist()
+    new_w = [c for c in codes if c not in wl]
+    if new_w:
+        wl.extend(new_w)
+        save_watchlist()
+    current = [p for p in st.query_params.get("h", "").split(";") if p]
+    have = {p.split(":")[0].upper() for p in current}
+    new_h = [p for p in holdings if p.split(":")[0] not in have]
+    if new_h:
+        st.query_params["h"] = ";".join(current + new_h)
+    return len(new_w), len(new_h)
+
+
+def added_text(n_w, n_h):
+    bits = ([f"{n_w} to your watchlist"] if n_w else []) + \
+           ([f"{n_h} holding{'s' if n_h != 1 else ''} to your Holdings tab"] if n_h else [])
+    return "Added " + " and ".join(bits) + "." if bits else "Everything in that list is already in your app."
+
+
+def drop_shared():
+    for k in SHARE_KEYS:
+        if k in st.query_params:
+            del st.query_params[k]
+
+
+def accept_shared():
+    n_w, n_h = add_shared(clean_codes(st.query_params.get("sw", "")), clean_holdings(st.query_params.get("sh", "")))
+    drop_shared()
+    st.session_state["shared_msg"] = added_text(n_w, n_h)
+
+
+def shared_banner():
+    """When the app is opened from a shared link: offer to add the list."""
+    msg = st.session_state.pop("shared_msg", None)
+    if msg:
+        st.toast(msg)
+    if not any(k in st.query_params for k in SHARE_KEYS):
+        return
+    codes, holdings = clean_codes(st.query_params.get("sw", "")), clean_holdings(st.query_params.get("sh", ""))
+    with st.container(border=True, key="shared_box"):
+        what = ([f"a watchlist of {len(codes)} ({', '.join(codes[:6])}{', …' if len(codes) > 6 else ''})"] if codes else []) + \
+               ([f"{len(holdings)} holding{'s' if len(holdings) != 1 else ''} with the number of shares"] if holdings else [])
+        if not what:
+            st.write("This link was meant to share a list, but it's empty or couldn't be read.")
+            st.button("Close", on_click=drop_shared, key="shared_close")
+            return
+        st.markdown(f"**Someone shared a list with you:** {' and '.join(what)}.")
+        st.caption("Adding it keeps everything you already have. Anything already in your app is skipped.")
+        with st.container(key="pair_shared"):
+            c1, c2 = st.columns(2)
+            c1.button("Add to my app", type="primary", on_click=accept_shared, width="stretch")
+            c2.button("Not now", on_click=drop_shared, width="stretch")
+
+
+def app_address():
+    """This app's web address without the query, for share links."""
+    url = getattr(st.context, "url", None) or ""
+    if not url:
+        host = (st.context.headers or {}).get("Host", "")
+        url = f"https://{host}/" if host else ""
+    url = url.split("?")[0].split("#")[0].replace("/~/+", "")   # Streamlit Cloud serves the app inside /~/+/
+    return url if url.endswith("/") else url + "/"
+
+
+def paste_shared(place):
+    """Add the list from a pasted link (a shared link, or a copied app address with ?w= / ?h=)."""
+    text = (st.session_state.get(f"paste_{place}") or "").strip()
+    st.session_state[f"paste_{place}"] = ""
+    if not text:
+        return
+    q = parse_qs(urlparse(text).query)
+    codes = clean_codes((q.get("sw") or q.get("w") or [""])[0])
+    holdings = clean_holdings((q.get("sh") or q.get("h") or [""])[0])
+    if not codes and not holdings:
+        st.session_state[f"paste_msg_{place}"] = ("warning", "That doesn't look like a shared list. Copy the whole "
+                                                             "link you were sent and paste it here.")
+        return
+    n_w, n_h = add_shared(codes, holdings)
+    st.session_state[f"paste_msg_{place}"] = ("success", added_text(n_w, n_h))
+
+
+def share_section(place):
+    """"Share my list" and "Add a list someone shared", on the Watchlist and Holdings tabs."""
+    wl = watchlist()
+    h_raw = st.query_params.get("h", "")
+    n_h = len([p for p in h_raw.split(";") if p])
+    with st.expander("Share my list"):
+        if not wl and not n_h:
+            st.write("Add shares or ETFs to your watchlist or holdings first.")
+        else:
+            st.write("Make a link to send someone, for example family on WhatsApp. When they open it, the app offers "
+                     "to add your shares and ETFs to theirs and keeps what they already have. The list travels in the "
+                     "link itself: it isn't stored anywhere else.")
+            inc_w = st.checkbox(f"My watchlist ({len(wl)})", value=place == "watch", key=f"share_w_{place}",
+                                disabled=not wl)
+            inc_h = st.checkbox(f"My holdings ({n_h}), with the number of shares", value=place == "mine",
+                                key=f"share_h_{place}", disabled=not n_h)
+            params = {}
+            if inc_w and wl:
+                params["sw"] = ",".join(wl)
+            if inc_h and n_h:
+                params["sh"] = h_raw
+            if params:
+                link = app_address() + "?" + urlencode(params)
+                st.code(link, language=None, wrap_lines=True)
+                text = f"My list in the WattleFolio Shariah Checker: {link}"
+                with st.container(key=f"pair_share_{place}"):
+                    c1, c2 = st.columns(2)
+                    c1.link_button("WhatsApp", "https://wa.me/?text=" + url_quote(text), width="stretch",
+                                   key=f"share_wa_{place}")
+                    c2.link_button("Email", "mailto:?subject=" + url_quote("My Shariah Checker list") +
+                                   "&body=" + url_quote(text), width="stretch", key=f"share_mail_{place}")
+                st.caption("Or copy the link above and paste it anywhere.")
+            else:
+                st.caption("Tick what you'd like to share.")
+    with st.expander("Add a list someone shared"):
+        st.write("Opening a shared link offers to add the list. If you use the app from your home screen, copy the "
+                 "link instead and paste it here, so the list is added to this app.")
+        st.text_input("Paste the link", key=f"paste_{place}", on_change=paste_shared, args=(place,),
+                      placeholder="https://…")
+        msg = st.session_state.pop(f"paste_msg_{place}", None)
+        if msg:
+            (st.success if msg[0] == "success" else st.warning)(msg[1])
+
+
+with shared_slot:
+    shared_banner()
 
 
 def watch_button(symbol, key, short=False):
@@ -1712,14 +1976,14 @@ DEVICE_KEYS = ["h", "w", "ccy", "etf"]
 # Shared by the device and reload scripts. On Streamlit Cloud the app sits in a frame inside Streamlit's own page;
 # the address that matters (home-screen shortcut, reload, copied link) is that outer page's, so update that one.
 GO_JS = """
-  const KEYS = %(keys)s;
+  const KEYS = %(keys)s, SHARE_KEYS = %(share_keys)s, SHARED = %(shared)s;   // a shared list waiting to be added
   function outer() {   // the outer page's address when it's on the same site, else this frame's
     try { const l = window.top.location; void l.pathname; return l; } catch (e) { return window.location; }
   }
   function query(base, params, t) {
     const q = new URLSearchParams(base);
-    KEYS.concat(["t"]).forEach(k => q.delete(k));
-    Object.entries(params || {}).forEach(([k, v]) => q.set(k, v));
+    KEYS.concat(SHARE_KEYS, ["t"]).forEach(k => q.delete(k));
+    Object.entries(Object.assign({}, params || {}, SHARED)).forEach(([k, v]) => q.set(k, v));
     if (t) q.set("t", String(t));
     return q.toString();
   }
@@ -1773,7 +2037,9 @@ def keep_on_device():
         t = int(st.query_params.get("t", "0"))
     except ValueError:
         t = 0
-    values = {"keys": json.dumps(DEVICE_KEYS), "state": json.dumps(state), "t": t}
+    shared = {k: st.query_params[k] for k in SHARE_KEYS if k in st.query_params}
+    values = {"keys": json.dumps(DEVICE_KEYS), "share_keys": json.dumps(SHARE_KEYS), "shared": json.dumps(shared),
+              "state": json.dumps(state), "t": t}
     run_in_app(DEVICE_JS % values, key="device")
     if st.session_state.pop("_reload", False):
         run_in_app(RELOAD_JS % values, key="reload")
@@ -1867,6 +2133,11 @@ def show_result(symbol, place, key):
         st.subheader("Cleaning dividends")
         st.write(f"Give **{s['purge_pct']:.2%}** of every dividend from this company to charity "
                  f"({s['purge_source'] or 'no revenue data'}).")
+        total = s["income"].get("total")
+        if total is not None and s["purge_source"].startswith("estimate") and s["purge_pct"] and not s.get("pre_revenue"):
+            st.caption(f"That's interest income as a share of revenue. As a share of total income (revenue plus "
+                       f"interest, the way AAOIFI measures it) it's {total:.2%}. The revenue figure is the more "
+                       f"cautious one to give from.")
         if s.get("pre_revenue"):
             st.caption("This is high because the company has almost no sales yet, so most of its income is "
                        "interest on its cash. Companies at this stage rarely pay dividends.")
@@ -2079,14 +2350,32 @@ def watchlist_tab():
     if refreshing:
         st.toast("Watchlist refreshed with the latest data from Yahoo Finance.")
 
+    # Compare each result with the one last seen. A result from incomplete Yahoo data isn't compared or saved.
+    seen, now, changed, first = watch_seen(), {}, {}, {}
+    for sym, d, _, s in items:
+        if s is None or d.get("profile_missing"):
+            continue
+        now[sym] = watch_status(s)
+        if sym not in seen:
+            first[sym] = now[sym]
+        elif seen[sym] != now[sym]:
+            changed[sym] = seen[sym]
+    if first:   # newly added: remember the result quietly
+        mark_seen(first)
+
     counts = {}
     for _, d, _, s in items:
         label = "Couldn't check" if s is None else ("Islamic fund" if s.get("islamic") else TIER_STYLE[s["tier"]][0])
         counts[label] = counts.get(label, 0) + 1
     order = ["Compliant", "Islamic fund", "On watch", "Not compliant", "Can't tell yet", "Couldn't check"]
     tier_of = {"Compliant": "Tier 1", "Islamic fund": "Tier 1", "On watch": "Tier 2", "Not compliant": "Tier 3"}
-    st.markdown('<div class="wsum">' + "".join(pill(f"{counts[k]} {k.lower()}", tier_of.get(k, "Incomplete"))
-                                               for k in order if k in counts) + "</div>", unsafe_allow_html=True)
+    changed_pill = (f'<span class="pill changed">{len(changed)} changed since you last looked</span>'
+                    if changed else "")
+    st.markdown('<div class="wsum">' + changed_pill + "".join(pill(f"{counts[k]} {k.lower()}", tier_of.get(k, "Incomplete"))
+                                                              for k in order if k in counts) + "</div>", unsafe_allow_html=True)
+    if len(changed) > 1:
+        st.button("Mark all as seen", on_click=mark_seen, args=({k: now[k] for k in changed},),
+                  help="Hide the \"changed\" notes until a result changes again")
 
     for sym, d, err, s in items:
         if d is None:
@@ -2104,6 +2393,16 @@ def watchlist_tab():
             change = f' <span class="{"up" if pct >= 0 else "down"}">{pct:+.2%}</span>'
         used, checked, old = based_on(d, s)
         warn = '<div class="wsub down">Some figures are over a year old</div>' if old else ""
+        nr = d.get("next_results")
+        if nr and (nr["date"] - date.today()).days >= 0:
+            warn += f'<div class="wsub"><b>Next results:</b> {html.escape(results_text(nr))} · check again after</div>'
+        elif nr:
+            warn += (f'<div class="wsub"><b>Results were due {nr["date"]:%d %b %Y}:</b> tap ↻ Refresh in a few days '
+                     f'for the new figures</div>')
+        note = ""
+        if sym in changed:
+            note = (f'<div class="wchange">Changed since you last looked: was <b>{html.escape(status_name(changed[sym]))}</b>, '
+                    f'now <b>{html.escape(status_name(now[sym]))}</b></div>')
         value_line = ""
         if d["kind"] == "stock":   # price check, as on the full result
             v = valuation(d)
@@ -2114,11 +2413,14 @@ def watchlist_tab():
             else:
                 value_line = '<div class="wsub">Price check: not enough data to estimate a value</div>'
         st.markdown(
-            f'<div class="wcard"><div class="wtop"><span><b>{html.escape(name_code(d["name"], d["symbol"]))}</b>'
-            f'</span>{pill(status, s["tier"])}</div>'
+            f'<div class="wcard{" changed" if note else ""}"><div class="wtop"><span><b>{html.escape(name_code(d["name"], d["symbol"]))}</b>'
+            f'</span>{pill(status, s["tier"])}</div>{note}'
             f'<div class="wprice">{price_text(d["price"], d["price_ccy"])}{change}</div>{value_line}'
             f'<div class="wsub"><b>Based on:</b> {html.escape(used)}</div>'
             f'<div class="wsub">{html.escape(checked)}</div>{warn}</div>', unsafe_allow_html=True)
+        if note:
+            st.button("OK, got it", key=f"wl_seen_{sym}", on_click=mark_seen, args=({sym: now[sym]},),
+                      help="Hide this note until the result changes again")
         with st.container(key=f"pair_wl_{sym}"):
             b1, b2 = st.columns(2)
             b1.button("Open full check →", key=f"wl_open_{sym}", on_click=open_check, args=("watch", sym, d["name"]),
@@ -2129,16 +2431,38 @@ def watchlist_tab():
 with tab_watch:
     if not navigated("watch", "your watchlist"):
         watchlist_tab()
+        share_section("watch")
 
-with tab_mine:
-    st.write("Your holdings are saved on this device and in the page link, so they're there next time, "
-             "including when you open the app from your home screen.")
-    holdings = read_holdings()
-    with st.expander("Edit my holdings", expanded=holdings.empty):
+def holding_name(code):
+    """Company or fund name for the Holdings editor ("" while unknown)."""
+    code = str(code or "").strip().upper()
+    if not code or code == "NONE":
+        return ""
+    d, err = get_data(code)
+    return "Code not found" if err else d["name"]
+
+
+def holdings_editor():
+    """The editable holdings table, with each code's name. Returns the table as edited.
+
+    The table it starts from is kept for the visit, because Streamlit restarts the editor (dropping an edit in
+    progress) whenever that table changes. It's rebuilt from the link when first shown, when the holdings change
+    elsewhere (e.g. a shared list was added), and when codes are added or changed, to fill in their names."""
+    ss, raw = st.session_state, st.query_params.get("h", "")
+    gen, rebuild = ss.get("holdings_gen", 0), ss.pop("holdings_rebuild", False)
+    if rebuild or f"holdings_editor_{gen}" not in ss or raw not in (ss.get("holdings_base_raw"), ss.get("holdings_written")):
+        base = read_holdings()
+        base.insert(1, "Name", [holding_name(c) for c in base["Code"]])
+        gen += 1
+        ss.update(holdings_gen=gen, holdings_base=base, holdings_base_raw=raw, holdings_written=raw)
+    base = ss["holdings_base"]
+    with st.expander("Edit my holdings", expanded=base.empty):
         edited = st.data_editor(
-            holdings, num_rows="dynamic", width="stretch", hide_index=True,
+            base, num_rows="dynamic", width="stretch", hide_index=True, key=f"holdings_editor_{gen}",
             column_config={
-                "Code": st.column_config.TextColumn("Code", width=74, help="Share or ETF code, e.g. BHP.AX"),
+                "Code": st.column_config.TextColumn("Code", width=74, help="Share or ETF code, e.g. BHP.AX", pinned=True),
+                "Name": st.column_config.TextColumn("Name", width=120, disabled=True,
+                                                    help="Filled in from Yahoo Finance once you've entered the code"),
                 "Shares": st.column_config.NumberColumn("Shares", width=70, min_value=0, step=1),
                 "Dividend per share (last 12 months)": st.column_config.NumberColumn(
                     "Div.", width=60, min_value=0, format="%.4f",
@@ -2146,7 +2470,20 @@ with tab_mine:
                 "Date it became not compliant": st.column_config.DateColumn(
                     "Red on", width=72, format="D/M/YY", help="Date it became not compliant. Only for stocks that turned red"),
             })
-        write_holdings(edited)
+        ss["holdings_written"] = write_holdings(edited)
+
+    def codes(df):
+        return [c for c in (str(x or "").strip().upper() for x in df["Code"]) if c and c != "NONE"]
+    if codes(edited) != codes(base):   # new or changed codes: start again from the saved list to show their names
+        ss["holdings_rebuild"] = True
+        st.rerun()
+    return edited
+
+
+def holdings_tab():
+    st.write("Your holdings are saved on this device and in the page link, so they're there next time, "
+             "including when you open the app from your home screen.")
+    edited = holdings_editor()
 
     rows = []
     for _, h in edited.iterrows():
@@ -2182,7 +2519,7 @@ with tab_mine:
                 lines.append(f"- **{name_code(r['d']['name'], r['d']['symbol'])}**: {when}")
             st.error("Not compliant, sell within 60 days:\n" + "\n".join(lines))
 
-        for r in rows:
+        for i, r in enumerate(rows):
             label, bg, fg, action = TIER_STYLE[r["s"]["tier"]]
             action = r["s"].get("action") or action
             flag = " · business needs a manual check" if r["s"]["business"] == "Review" else ""
@@ -2192,6 +2529,8 @@ with tab_mine:
               <div style="font-size:1rem">{action}{flag}</div>
               <div class="who" style="margin-top:0.4rem">Value {money(r['value'], r['d']['price_ccy'])} · price {r['d']['price_date']}</div>
             </div>""", unsafe_allow_html=True)
+            st.button("Open full check →", key=f"mine_open_{i}_{r['d']['symbol']}", on_click=open_check,
+                      args=("mine", r["d"]["symbol"], r["d"]["name"]))
 
         st.subheader("Before Ramadan")
         days = (NEXT_REVIEW - date.today()).days
@@ -2209,6 +2548,12 @@ with tab_mine:
     elif edited.empty:
         st.info("Add your shares above to see whether each one is still compliant.")
 
+
+with tab_mine:
+    if not navigated("mine", "your holdings"):
+        holdings_tab()
+        share_section("mine")
+
 with tab_how:
     st.markdown(f"""
 **1. What the business does.** Companies in conventional banking or insurance, gambling, alcohol,
@@ -2216,11 +2561,16 @@ pork or non-halal food, tobacco, adult entertainment or aggressive weapons are e
 Less than 5% of revenue may come from non-permissible sources.
 
 The app checks this automatically. It **fails** a company in an excluded industry, or whose interest income
-is 5% of revenue or more. It **passes** a company only when its industry isn't a risky one, its company
-description mentions nothing non-permissible, and its interest income is under 5%. Anything else, such as
+is clearly 5% of revenue or more. It **passes** a company only when its industry isn't a risky one, its company
+description mentions nothing non-permissible, and its interest income is clearly under 5%. Anything else, such as
 supermarkets that sell alcohol, restaurants, hotels or defence companies, shows **needs a manual check**
 until it has been checked by hand and the decision recorded in the app's review list. A recorded decision
 always overrides the automatic check.
+
+Interest income is only an estimate of non-permissible income, so when it's close to the limit
+(between {(REVENUE_LIMIT - INCOME_BORDER) * 100:g}% and {(REVENUE_LIMIT + INCOME_BORDER) * 100:g}% of revenue)
+the company also shows **needs a manual check** instead of an automatic pass or fail. The app shows the figure two
+ways: as a share of revenue, and as a share of total income (revenue plus interest), which is how AAOIFI measures it.
 The automatic check can't see small amounts of non-permissible revenue that a company doesn't describe.
 
 **2. The company's finances.** Three figures are compared with the company's average value over 2 years:
@@ -2261,9 +2611,17 @@ recommendations. The list is worked out once a day, so the first search of the d
 **8. Watchlist.** Add any share or ETF with **☆ Add to watchlist** on its result, **☆ Watch** in Find, or by
 typing its code in the Watchlist tab. Each one shows whether it's compliant, its price, and what the result is
 based on: the annual report and balance sheet dates (or where an ETF's holdings came from) and when WattleFolio
-last checked it, and for companies the Price check zone and estimated value. Tap **↻ Refresh** to fetch the latest
-data for everything on it (once a minute at most).
-Your watchlist is saved in the page link.
+last checked it, and for companies the Price check zone, estimated value and when the next results are due
+(Yahoo Finance's date, or a rough guess from the company's usual reporting cycle). Check again after new results,
+as the figures can change. Tap **↻ Refresh** to fetch the latest data for everything on it (once a minute at most).
+
+When a result changes from the one you last saw (for example from compliant to on watch, or to "needs a manual
+check"), its card is highlighted and says what it was before. Tap **OK, got it** to hide the note.
+
+**Sharing your list.** Under **Share my list** (on the Watchlist and Holdings tabs) the app makes a link with your
+watchlist and, if you tick it, your holdings. Send it on WhatsApp or by email. When someone opens it, the app offers
+to add the list to theirs, keeping what they already have. If they use the app from their home screen, they can
+paste the link under **Add a list someone shared** instead.
 
 **9. Price check.** For companies, the current price is compared with an estimated value from formulas
 value investors use: the Graham Number, Graham's growth formula, a discounted cash flow, and (for dividend payers)
@@ -2299,8 +2657,9 @@ the company's annual reports (ASX announcements, SEC 10-K filings or Bursa Malay
 and a search for its latest annual report, so you can check the figures yourself.
 
 **Saving on your phone.** Your watchlist, holdings, currency and ETF setting are kept in the page link and also
-saved on this device, so opening the app from a home-screen shortcut brings back your latest changes. A newer link
-(for example one someone sends you) replaces what's saved. Tap **↻ Reload app** to get the latest version of the app.
+saved on this device, so opening the app from a home-screen shortcut brings back your latest changes. Tap
+**↻ Reload app** to get the latest version of the app. Each phone keeps its own list: use **Share my list** to send
+yours to someone else's phone.
 
 Figures can be delayed or incomplete. This app is a calculator,
 not a fatwa or financial advice. Check with a scholar you trust.

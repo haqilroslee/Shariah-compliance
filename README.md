@@ -15,17 +15,22 @@ Takes about 15 minutes, once. Do this on a computer.
 
 ## 3. Set up your father-in-law's link
 1. Open the app, go to **Holdings**, tap **Edit my holdings** and enter his shares (code + number of shares, plus dividends if known).
-2. Copy the full address from the browser bar. His holdings are stored in that link.
-3. Send him the link. On his phone: open it, then **Share → Add to Home Screen**. It now works like an app.
-If his holdings change, update them in the app and send him the new link.
+2. Open **Share my list** (bottom of the Holdings tab), tick his holdings (and the watchlist if you like) and tap
+   **WhatsApp** or **Email** to send him the link.
+3. On his phone: open the link, tap **Add to my app**, then **Share → Add to Home Screen**. It now works like an app.
+If his holdings change, send him a new link. If he already has the app on his home screen, he copies the link and
+pastes it under **Add a list someone shared**: only what he doesn't already have is added.
 
 ## Checking a company's business activities
 The app checks business activities automatically:
 - **Fail:** the industry is excluded (banks, insurance, gambling, alcohol, tobacco and so on), or interest
-  income is 5% of revenue or more.
+  income is 5.5% of revenue or more.
 - **Needs a manual check:** the industry often mixes permissible and non-permissible sales (supermarkets,
   restaurants, hotels, defence, REITs, packaged food and so on), the company description mentions something
-  like alcohol, gambling, pork or lending, or figures are missing.
+  like alcohol, gambling, pork or lending, figures are missing, or interest income is close to the 5% limit
+  (4.5–5.5% of revenue, set by `INCOME_BORDER`). Interest income is only an estimate, so close calls are left to
+  the annual report. The app shows it both as a share of revenue and of total income (revenue plus interest, the
+  AAOIFI way).
 - **Pass:** none of the above.
 
 The lists are at the top of `app.py` (`EXCLUDED_KEYWORDS`, `REVIEW_KEYWORDS`, `DESCRIPTION_FLAGS`).
@@ -84,8 +89,21 @@ refreshes the funds listed in `etf_holdings/sources.csv` every weekday night; se
 ## Watchlist
 The **Watchlist** tab gives a quick overview of chosen shares and ETFs: status, price and today's change, and what
 each result is based on (annual report year and balance sheet date, or the ETF holdings source and date) plus when
-WattleFolio checked it. Add from any result (**☆ Add to watchlist**), from Find (**☆ Watch**) or by typing a code.
-The list is saved in the link (`?w=BHP.AX,SPY`), like holdings.
+WattleFolio checked it, and for companies the Price check zone and when the next results are due (Yahoo's date, or
+a rough guess from the reporting cycle: quarterly for US and Bursa companies, half-yearly for others). Add from any
+result (**☆ Add to watchlist**), from Find (**☆ Watch**) or by typing a code. **↻ Refresh** fetches fresh data.
+The list is saved in the link with the last result seen for each code (`?w=BHP.AX:C,SPY:W`). When a result
+changes, its card is highlighted with the old and new result until you tap **OK, got it**.
+
+## Sharing a list
+**Share my list** (Watchlist and Holdings tabs) makes a link carrying the watchlist (`?sw=`) and, if ticked, the
+holdings (`?sh=`). Opening it shows **Someone shared a list with you** with **Add to my app** / **Not now**; adding
+keeps what's already there and skips duplicates. **Add a list someone shared** takes a pasted link instead, for
+apps opened from a home-screen icon. Nothing is stored on a server: the list is in the link.
+
+## Holdings
+Enter code, number of shares and (optionally) dividends and the date a stock turned red. The **Name** column fills
+in from Yahoo Finance to confirm each code ("Code not found" means a typo). Each holding has **Open full check →**.
 
 ## Price check
 Company results include a **Price check**: the price against an estimated value, the middle of the Graham Number,
@@ -97,8 +115,8 @@ Assumptions (`DISCOUNT_RATE`, `TERMINAL_GROWTH`, `GROWTH_CAP`, `GRAHAM_BOND_YIEL
 ## Saving on your phone and reloading
 The watchlist, holdings, currency and ETF setting are kept in the link and also saved on the device (browser
 storage), with a time stamp (`?t=`). A home-screen shortcut keeps the link it was saved with, so on opening the app
-restores the newer saved version; a newer link (e.g. one someone sends) replaces what's saved. **↻ Reload app** (top
-right) reloads the page to pick up the latest version of the app without losing anything.
+restores the newer saved version. **↻ Reload app** (top right) reloads the page to pick up the latest version of the
+app without losing anything. Each phone keeps its own list; use **Share my list** to copy it to another phone.
 
 ## Prices and currency
 Each result shows key figures (price and today's change, market value or fund size and fees, P/E, dividend
